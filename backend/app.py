@@ -52,7 +52,7 @@ from levels import (
 )
 from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
-    get_team_season_pitchers,
+    get_team_season_pitchers, get_all_milb_pitchers,
 )
 from redis_cache import redis_get, redis_set, redis_delete
 
@@ -1235,7 +1235,7 @@ def pitchers_search(response: Response, q: str = Query(""), start_date: str = Qu
     # Fast, non-blocking fetch: serves a cached/partial list immediately and
     # warms the full list in the background instead of materializing the whole
     # season DataFrame on the request path.
-    pitchers = fetch_pitchers_directory(start_date, end_date)
+    pitchers = _merged_pitcher_directory(start_date, end_date)
     if q and pitchers:
         # Accent-insensitive substring match — "emerson" should find "Émerson"
         # and vice versa. Uses the name_norm precomputed at list-build time so
@@ -1247,25 +1247,67 @@ def pitchers_search(response: Response, q: str = Query(""), start_date: str = Qu
         ]
     return pitchers[:20]
 
+def _merged_pitcher_directory(start_date, end_date):
+    """Searchable directory covering EVERY level.
+
+    Two sources, deliberately:
+      - the Savant directory (AAA + AFL) carries the rich ranking signals the
+        search UI sorts on — real pitch counts and a last-appearance date;
+      - the affiliate sweep covers AA/A+/A/R, who have player pages but no
+        Statcast and would otherwise be unsearchable.
+
+    Savant wins on conflict for the fields it has, since its pitch counts are
+    per-pitch-accurate and its `hand` is real. Level/org tags ride along from
+    the sweep so results can show "(CLE, AA)".
+    """
+    savant = fetch_pitchers_directory(start_date, end_date) or []
+    try:
+        milb = get_all_milb_pitchers(int(start_date[:4])) or []
+    except Exception as e:
+        print(f"[Directory] all-levels sweep failed, serving Savant-only: {e}")
+        return savant
+
+    merged = {int(r["pitcher_id"]): dict(r) for r in milb}
+    for r in savant:
+        pid = int(r["pitcher_id"])
+        base = merged.get(pid)
+        if base is None:
+            merged[pid] = dict(r)
+            continue
+        # Savant's signals are better where present; keep the sweep's tags.
+        base.update({
+            "name": r.get("name") or base.get("name"),
+            "name_norm": r.get("name_norm") or base.get("name_norm"),
+            "hand": r.get("hand") or base.get("hand"),
+            "pitches": r.get("pitches") or base.get("pitches"),
+            "last_date": r.get("last_date") or base.get("last_date"),
+        })
+        for t in (r.get("teams") or []):
+            if t and t not in base.get("teams", []):
+                base.setdefault("teams", []).append(t)
+    return sorted(merged.values(), key=lambda r: r.get("name") or "")
+
+
 @app.get("/api/pitchers-directory")
 def pitchers_directory(response: Response, start_date: str = Query(SEASON_START), end_date: str = Query("")):
     """Full lightweight pitcher directory for client-side search.
 
-    The list is small (~600 records) and stable across the season, so the UI
-    fetches it once and filters/ranks locally — no per-keystroke round trip.
-    Each record carries name_norm (accent-stripped) plus ranking signals
-    (pitches, last_date) so the client can sort by relevance.
+    Covers every level, not just the Statcast ones — a AA-only pitcher has a
+    player page and must be findable. The list is stable across the season, so
+    the UI fetches it once and filters/ranks locally. Each record carries
+    name_norm (accent-stripped) plus ranking signals (pitches, last_date) and
+    level/org tags.
     """
     end_date = _resolve_end_date(end_date)
     _set_response_cache(response, _cache_scope_for_date(end_date))
-    return fetch_pitchers_directory(start_date, end_date)
+    return _merged_pitcher_directory(start_date, end_date)
 
 @app.get("/api/resolve-pitcher")
 def resolve_pitcher(response: Response, name: str = Query(...), start_date: str = Query(SEASON_START), end_date: str = Query("")):
     """Resolve a pitcher name to a pitcher_id from cached data. Uses accent-insensitive matching."""
     end_date = _resolve_end_date(end_date)
     _set_response_cache(response, _cache_scope_for_date(end_date))
-    pitchers = fetch_pitchers_directory(start_date, end_date)
+    pitchers = _merged_pitcher_directory(start_date, end_date)
     if not pitchers:
         return {"pitcher_id": None, "name": name}
 
@@ -1761,8 +1803,18 @@ def cron_warmup_daily_season(request: Request, response: Response):
                 print(f"[WarmupDaily2] org {org} failed: {e}")
                 skipped_orgs.append(org)
 
+        # All-levels search directory. Every affiliate call it needs is warm
+        # from the loop above, so this is nearly free here and saves the first
+        # searcher of the day a ~200-request cold sweep.
+        directory_size = 0
+        try:
+            directory_size = len(get_all_milb_pitchers(season_year, deadline=deadline) or [])
+        except Exception as e:
+            print(f"[WarmupDaily2] directory build failed: {e}")
+
         return {"status": "ok", "orgs_warmed": len(warmed_orgs),
                 "orgs_skipped": skipped_orgs,
+                "directory_pitchers": directory_size,
                 "budget_hit": bool(skipped_orgs)}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")

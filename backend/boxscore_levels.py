@@ -8,6 +8,9 @@ airOuts), both of which the API hands us the inputs for directly.
 The Statcast levels (AAA, AFL-with-data) go through aggregation.py instead;
 this module is the adapted-table path.
 """
+import base64
+import gzip
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +55,35 @@ def _l2_set(key, value, ttl):
         redis_set(key, value, ttl=ttl)
     except Exception:
         pass
+
+
+# The all-levels directory is ~730 KB of JSON — under Upstash's 1 MB
+# per-request ceiling today, but not with any headroom as the season adds
+# pitchers. gzip+base64 takes it to ~160 KB. Mirrors data.py's range-snapshot
+# compression; kept local here to avoid a boxscore_levels -> data import cycle.
+_GZ_MARKER = "__gz__"
+
+
+def _l2_set_compressed(key, value, ttl):
+    try:
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        packed = base64.b64encode(gzip.compress(raw)).decode("ascii")
+        redis_set(key, {_GZ_MARKER: packed}, ttl=ttl)
+    except Exception as e:
+        print(f"[BoxLevels] compressed set failed for {key}: {e}")
+
+
+def _l2_get_compressed(key):
+    val = _l2_get(key)
+    if val is None:
+        return None
+    if isinstance(val, dict) and _GZ_MARKER in val:
+        try:
+            return json.loads(gzip.decompress(base64.b64decode(val[_GZ_MARKER])))
+        except Exception as e:
+            print(f"[BoxLevels] decompress failed for {key}: {e}")
+            return None
+    return val  # legacy uncompressed entry
 
 
 def _two_tier(l1, l1_key, redis_key, ttl, compute):
@@ -470,6 +502,88 @@ def _fetch_person_info(pitcher_id):
     except Exception as e:
         print(f"[BoxLevels] people lookup failed for {pitcher_id}: {e}")
     return info
+
+
+_DIRECTORY_TTL = 6 * 3600
+_directory_cache = {}  # { season: (timestamp, rows) }
+
+
+def get_all_milb_pitchers(season, deadline=None):
+    """Every pitcher with a 2026 appearance at ANY level, for search.
+
+    The Savant-derived directory only sees AAA + AFL (that is the whole pitch
+    universe), so on its own it makes ~80% of the players in this app
+    unsearchable even though they all have player pages. This sweeps every
+    affiliate of every org via the per-team season endpoint — one request per
+    affiliate, the same cached calls org pages already make.
+
+    Returns rows shaped like build_pitchers_list_from_df's so the two lists
+    merge cleanly: {pitcher_id, name, name_norm, teams, hand, pitches,
+    last_date, levels, orgs}. `hand` and `last_date` are unavailable from
+    season stats and come back None — the Savant list fills them in for AAA,
+    and the client's ranking already tolerates nulls.
+    """
+    from season import strip_accents
+    season = int(season)
+    now = time.time()
+    hit = _directory_cache.get(season)
+    if hit and (now - hit[0]) < _DIRECTORY_TTL:
+        return hit[1]
+    cached = _l2_get_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}")
+    if cached is not None:
+        _directory_cache[season] = (now, cached)
+        return cached
+
+    from levels import affiliates_for_org, all_orgs
+    affiliates = [m for org in all_orgs() for m in affiliates_for_org(org)]
+    by_pitcher = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(get_team_season_pitchers, m["team_id"], m["level"], season): m
+            for m in affiliates
+        }
+        for f in as_completed(futures):
+            if deadline is not None and time.time() >= deadline:
+                break
+            meta = futures[f]
+            try:
+                rows = f.result() or []
+            except Exception as e:
+                print(f"[Directory] {meta['name']} failed: {e}")
+                continue
+            for r in rows:
+                pid = r.get("pitcher_id")
+                if pid is None:
+                    continue
+                pid = int(pid)
+                entry = by_pitcher.get(pid)
+                if entry is None:
+                    entry = {
+                        "pitcher_id": pid,
+                        "name": r.get("pitcher") or "",
+                        "name_norm": strip_accents((r.get("pitcher") or "").lower()),
+                        "teams": [],
+                        # hand/last_date are not in season stats — the Savant
+                        # merge fills them for AAA. Omitted rather than stored
+                        # as 4,481 nulls (~130 KB of dead payload).
+                        "pitches": 0,
+                        "levels": [],
+                        "orgs": [],
+                    }
+                    by_pitcher[pid] = entry
+                if r.get("team") and r["team"] not in entry["teams"]:
+                    entry["teams"].append(r["team"])
+                if r.get("level") and r["level"] not in entry["levels"]:
+                    entry["levels"].append(r["level"])
+                if r.get("org") and r["org"] not in entry["orgs"]:
+                    entry["orgs"].append(r["org"])
+                entry["pitches"] += int(r.get("pitches") or 0)
+
+    result = sorted(by_pitcher.values(), key=lambda r: r["name"])
+    if result:
+        _directory_cache[season] = (now, result)
+        _l2_set_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}", result, _DIRECTORY_TTL)
+    return result
 
 
 def current_level(pitcher_id, season):

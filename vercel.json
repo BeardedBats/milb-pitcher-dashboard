@@ -1,0 +1,54 @@
+{
+  "buildCommand": "cd frontend && npm install && DISABLE_ESLINT_PLUGIN=true npm run build",
+  "outputDirectory": "frontend/build",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "memory": 3009
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/materialize-ranges",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/warmup",
+      "schedule": "0 0-4,17-23 * * *"
+    },
+    {
+      "path": "/api/cron/stat-corrections",
+      "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-daily",
+      "schedule": "20 7 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-daily-2",
+      "schedule": "40 7 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-daily-players",
+      "schedule": "0 8 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-daily-cards",
+      "schedule": "20 8 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-live-cards",
+      "schedule": "*/10 15-23,0-6 * * *"
+    },
+    {
+      "path": "/api/cron/warmup-live-game-views",
+      "schedule": "*/2 15-23,0-6 * * *"
+    }
+  ]
+}

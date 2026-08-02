@@ -1,0 +1,8 @@
+# Canonical pinned runtime deps. Vercel installs THIS file (it sits next to
+# the serverless entry api/index.py). For local dev: pip install -r requirements-dev.txt
+fastapi==0.131.0
+pandas==3.0.1
+numpy==2.4.2
+requests==2.32.5
+upstash-redis==1.7.0
+tzdata==2025.3

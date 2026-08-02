@@ -1,4 +1,4 @@
-# MiLB Pitcher Dashboard
+# MiLB Pitcher Dashboard (Vercel branch)
 
 Staff-facing **minor-league** pitcher stats dashboard for PitcherList — a local-only fork of the MLB Pitcher Dashboard covering Triple-A through Rookie ball plus the Arizona Fall League. Game cards, season totals, strike-zone plots, velocity trends and play-by-play for the levels that have Statcast; box-score tables for the ones that don't.
 

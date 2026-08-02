@@ -1,5 +1,6 @@
-# Local development extras on top of the canonical runtime set
--r backend/requirements.txt
+# Local development + CI extras on top of the canonical runtime set
+# (api/requirements.txt is what Vercel installs — it sits next to api/index.py)
+-r api/requirements.txt
 uvicorn[standard]==0.41.0
 pytest==9.0.3
 httpx==0.28.1

@@ -1,0 +1,21 @@
+*.rar
+*.zip
+dist/
+node_modules/
+Old/
+HTML Tests/
+frontend-build/
+electron/
+assets/
+*.docx
+*.lnk
+*.vbs
+*.bat
+*.sh
+BUILD.md
+VERCEL-MIGRATION.md
+.github/
+/package.json
+/package-lock.json
+/index.py
+Dockerfile

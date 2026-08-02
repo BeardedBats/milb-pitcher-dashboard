@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from redis_cache import redis_get, redis_set
 from levels import (
     DEFAULT_LEVEL, LEVEL_ORDER, LEVELS, normalize_level, org_for_team,
     team_display_name, team_meta_by_id,
@@ -29,6 +30,46 @@ _BOX_TTL_FINAL = 24 * 3600
 _BOX_TTL_LIVE = 60
 _box_cache = {}  # { game_pk: (timestamp, is_final, payload) }
 _box_lock = threading.Lock()
+
+# Everything in this module is two-tier: an in-process dict (L1) in front of
+# Redis (L2). On a persistent uvicorn the L1 dict alone is enough, but on
+# serverless every cold start begins with an empty L1 — without L2 a single
+# player page would re-run 6 gameLog calls and an org page one request per
+# affiliate, on every invocation.
+_MILB_CACHE_PREFIX = "milb"
+_rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
+
+
+def _l2_get(key):
+    try:
+        return redis_get(key)
+    except Exception:
+        return None
+
+
+def _l2_set(key, value, ttl):
+    try:
+        redis_set(key, value, ttl=ttl)
+    except Exception:
+        pass
+
+
+def _two_tier(l1, l1_key, redis_key, ttl, compute):
+    """L1 dict -> Redis -> origin. Only non-empty results are cached, so a
+    transient API failure stays retryable instead of being memoized as 'none'."""
+    now = time.time()
+    hit = l1.get(l1_key)
+    if hit and (now - hit[0]) < ttl:
+        return hit[1]
+    cached = _l2_get(redis_key)
+    if cached is not None:
+        l1[l1_key] = (now, cached)
+        return cached
+    value = compute()
+    if value:
+        l1[l1_key] = (now, value)
+        _l2_set(redis_key, value, ttl)
+    return value
 
 
 def _num(v, default=0):
@@ -89,6 +130,26 @@ def _fetch_boxscore(game_pk):
 
 
 def _rows_for_game(game, level):
+    """Adapted result rows for one game's pitchers, cached through Redis.
+
+    The DERIVED rows are cached, not the raw box score — a box score payload is
+    hundreds of KB and would blow past Upstash's per-request limit for a full
+    slate, while the rows for one game are a few KB.
+
+    A final game's rows never change, so they cache for a day; a live game's
+    cache for a minute so the table keeps moving.
+    """
+    is_final = (game.get("abstract_state") == "Final")
+    ttl = _BOX_TTL_FINAL if is_final else _BOX_TTL_LIVE
+    game_pk = int(game["game_pk"])
+    redis_key = f"{_MILB_CACHE_PREFIX}:rows:{level}:{game_pk}:{'F' if is_final else 'L'}"
+    return _two_tier(
+        _rows_cache, (game_pk, level, is_final), redis_key, ttl,
+        lambda: _build_rows_for_game(game, level),
+    )
+
+
+def _build_rows_for_game(game, level):
     """Adapted result rows for one game's pitchers (both sides)."""
     box = _fetch_boxscore(game["game_pk"])
     if not box:
@@ -262,11 +323,14 @@ def get_multi_level_game_log(pitcher_id, season):
     (sportId 1) is never queried — this build excludes major-league games.
     """
     pitcher_id, season = int(pitcher_id), int(season)
-    key = (pitcher_id, season)
-    now = time.time()
-    hit = _log_cache.get(key)
-    if hit and (now - hit[0]) < _LOG_TTL:
-        return hit[1]
+    return _two_tier(
+        _log_cache, (pitcher_id, season),
+        f"{_MILB_CACHE_PREFIX}:gamelog:{pitcher_id}:{season}", _LOG_TTL,
+        lambda: _build_multi_level_game_log(pitcher_id, season),
+    )
+
+
+def _build_multi_level_game_log(pitcher_id, season):
     rows = []
     with ThreadPoolExecutor(max_workers=6) as pool:
         futures = {
@@ -286,7 +350,6 @@ def get_multi_level_game_log(pitcher_id, season):
             continue
         seen.add(r["game_pk"])
         deduped.append(r)
-    _log_cache[key] = (now, deduped)
     return deduped
 
 
@@ -307,11 +370,15 @@ def get_team_season_pitchers(team_id, level, season):
     pulling a box score per game) would be several hundred requests per org.
     """
     team_id, season = int(team_id), int(season)
-    key = (team_id, season)
-    now = time.time()
-    hit = _team_season_cache.get(key)
-    if hit and (now - hit[0]) < _TEAM_SEASON_TTL:
-        return hit[1]
+    level = normalize_level(level)
+    return _two_tier(
+        _team_season_cache, (team_id, season),
+        f"{_MILB_CACHE_PREFIX}:teamseason:{level}:{team_id}:{season}", _TEAM_SEASON_TTL,
+        lambda: _build_team_season_pitchers(team_id, level, season),
+    )
+
+
+def _build_team_season_pitchers(team_id, level, season):
     cfg = LEVELS[normalize_level(level)]
     url = _TEAM_SEASON_URL.format(season=season, sport_id=cfg["sport_id"], team_id=team_id)
     rows = []
@@ -363,12 +430,13 @@ def get_team_season_pitchers(team_id, level, season):
                 "role": "SP" if games_started else "RP",
             })
     rows.sort(key=lambda r: (-(r.get("games_started") or 0), -(r.get("games") or 0)))
-    _team_season_cache[key] = (now, rows)
     return rows
 
 
 _PEOPLE_URL = "https://statsapi.mlb.com/api/v1/people/{pitcher_id}"
 _person_cache = {}
+# A player's name and throwing hand don't change — cache for a week.
+_PERSON_TTL = 7 * 24 * 3600
 
 
 def get_person_info(pitcher_id):
@@ -379,8 +447,14 @@ def get_person_info(pitcher_id):
     without this the page would render a nameless header.
     """
     pitcher_id = int(pitcher_id)
-    if pitcher_id in _person_cache:
-        return _person_cache[pitcher_id]
+    return _two_tier(
+        _person_cache, pitcher_id,
+        f"{_MILB_CACHE_PREFIX}:person:{pitcher_id}", _PERSON_TTL,
+        lambda: _fetch_person_info(pitcher_id),
+    )
+
+
+def _fetch_person_info(pitcher_id):
     info = {}
     try:
         resp = requests.get(_PEOPLE_URL.format(pitcher_id=pitcher_id), timeout=15)
@@ -395,8 +469,6 @@ def get_person_info(pitcher_id):
             }
     except Exception as e:
         print(f"[BoxLevels] people lookup failed for {pitcher_id}: {e}")
-    if info:
-        _person_cache[pitcher_id] = info
     return info
 
 

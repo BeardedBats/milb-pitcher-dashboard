@@ -28,6 +28,7 @@ from data import (
     fetch_date_range_materialized, fetch_all_pitchers_list_materialized,
     fetch_pitchers_directory,
     queue_range_materialization, get_range_materialization_status,
+    drain_pending_materializations,
     start_warmup, get_warmup_status, get_agg_cache, set_agg_cache,
     warmup_range_data, fetch_date, fetch_pitcher_season, compute_player_page,
     invalidate_pitcher_related_caches,
@@ -36,6 +37,7 @@ from data import (
     season_cache_suffix as _season_cache_suffix,
     get_stat_lines_refresh, record_stat_lines_refresh, fetch_game_pitches,
     check_boxscore_stat_corrections, get_game_level_map,
+    get_probable_starter_ids, _get_mlb_schedule,
 )
 from aggregation import (
     aggregate_pitch_data, aggregate_pitcher_results, get_pitcher_card,
@@ -52,7 +54,7 @@ from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers,
 )
-from redis_cache import redis_get, redis_set
+from redis_cache import redis_get, redis_set, redis_delete
 
 app = FastAPI(title="MiLB Pitcher Dashboard API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -77,13 +79,18 @@ async def _reject_malformed_date_params(request: Request, call_next):
 # Look for frontend build in ../frontend-build (relative to backend/)
 _FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend-build"
 
+# ── Detect environment: serverless (Vercel) vs persistent (local/Electron) ──
+_IS_SERVERLESS = os.environ.get("VERCEL") == "1" or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
 # CARD_SCHEMA_VERSION is imported from data.py — bump it there when a cached
 # payload shape changes so all card/season-totals/player-page caches miss.
 
-# ── Startup: pre-fetch data in background ──
+# ── Startup: pre-fetch data in background (local/Electron only) ──
+# NEVER on serverless: every cold start would kick off a full-season Savant
+# fetch across all Statcast levels. Vercel warms caches via the crons instead.
 @app.on_event("startup")
 def on_startup():
-    start_warmup()
+    if not _IS_SERVERLESS:
+        start_warmup()
 
 
 # ── Helper: resolve end_date to today ET ──
@@ -1450,6 +1457,520 @@ def undo_reclassify(response: Response, game_pk: int = Query(...), pitcher_id: i
 def pitch_overrides(response: Response):
     _set_response_cache(response, "live")
     return get_all_overrides()
+
+
+def _require_cron_auth(request: Request):
+    """Cron + materialize endpoints fail CLOSED on serverless.
+
+    An unset CRON_SECRET must NOT mean "open to everyone" — that was the
+    fail-open bug the upstream audit fixed. Locally (_IS_SERVERLESS false) the
+    guard is skipped so these stay callable by hand.
+    """
+    if not _IS_SERVERLESS:
+        return None
+    cron_secret = os.environ.get("CRON_SECRET")
+    auth = request.headers.get("authorization")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        return _json_response({"error": "Unauthorized"}, status_code=401, scope="mutation")
+    return None
+
+
+@app.get("/api/materialize-range")
+def materialize_range(
+    request: Request,
+    response: Response,
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+):
+    _set_response_cache(response, "mutation")
+    cron_secret = os.environ.get("CRON_SECRET")
+    auth = request.headers.get("authorization")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        return _json_response({"error": "Unauthorized"}, status_code=401, scope="mutation")
+    if not (_valid_date_param(start_date) and _valid_date_param(end_date)):
+        return _json_response({"error": "Invalid date format; expected YYYY-MM-DD"}, status_code=400, scope="mutation")
+    if start_date > end_date:
+        return _json_response({"error": "start_date must be before or equal to end_date"}, status_code=400, scope="mutation")
+    job = queue_range_materialization(start_date, end_date)
+    return _json_response(
+        {
+            "status": job.get("status", "pending"),
+            "start_date": start_date,
+            "end_date": end_date,
+            "materialization_started": bool(job.get("queued")),
+            **({"error": job.get("error")} if job.get("error") else {}),
+        },
+        status_code=202,
+        scope="mutation",
+    )
+
+
+@app.get("/api/materialize-status")
+def materialize_status(
+    request: Request,
+    response: Response,
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+):
+    _set_response_cache(response, "mutation")
+    cron_secret = os.environ.get("CRON_SECRET")
+    auth = request.headers.get("authorization")
+    if not cron_secret or auth != f"Bearer {cron_secret}":
+        return _json_response({"error": "Unauthorized"}, status_code=401, scope="mutation")
+    if not (_valid_date_param(start_date) and _valid_date_param(end_date)):
+        return _json_response({"error": "Invalid date format; expected YYYY-MM-DD"}, status_code=400, scope="mutation")
+    return _json_response(get_range_materialization_status(start_date, end_date), scope="mutation")
+
+
+@app.get("/api/cron/materialize-ranges")
+def cron_materialize_ranges(request: Request, response: Response, max_jobs: int = Query(1)):
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        drained = drain_pending_materializations(max_jobs=max_jobs)
+        return {"status": "ok", "count": len(drained), "drained": drained}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup")
+def cron_warmup(request: Request, response: Response):
+    """Off-season hourly warmup. Covers the Statcast levels only — that's the
+    whole pitch-data universe (see data.STATCAST_SCOPE)."""
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        warmup_range_data()
+        now = _now_et().isoformat()
+        redis_set("last_refresh", now)
+        return {"status": "ok", "timestamp": now}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+# ── Daily warmup: every level, budgeted ────────────────────────────────────
+# The MLB app warmed ONE slate per day. Here there are six, so each daily cron
+# loops levels under a deadline and reports which ones it got to. Statcast
+# levels (AAA/AFL) get the pitch + results aggregations; the rest get the
+# box-score results table, which is all that exists for them.
+
+def _recent_dates_for_stat_corrections(days_back=14):
+    today = _now_et().date()
+    return [(today - timedelta(days=offset)).isoformat() for offset in range(1, days_back + 1)]
+
+
+def _final_game_pks_for_date(date_str, levels=STATCAST_LEVELS):
+    """Final game_pks on a date across the given levels.
+
+    Never sportId=1 — the MLB version of this helper hardcoded it, which would
+    have swept major-league games this app doesn't even display.
+    """
+    game_pks = []
+    for code in levels:
+        for game in (_get_mlb_schedule(date_str, level=code) or []):
+            abstract_state = (game.get("abstract_state") or "")
+            detailed_state = (game.get("status") or "")
+            if abstract_state == "Final" or "Final" in detailed_state:
+                game_pks.append(int(game["game_pk"]))
+    return game_pks
+
+
+@app.get("/api/cron/stat-corrections")
+def cron_stat_corrections(request: Request, response: Response, days_back: int = Query(14)):
+    """Daily stat-correction sweep.
+
+    Re-fetches recent final Statcast-level boxscores, compares them against
+    cached final lines, and clears date/player caches when official pitcher
+    lines changed. The box-score levels have no pitch-derived lines to compare,
+    so their daily caches are simply dropped for the swept dates and recompute
+    on next request.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        # Reserve ~60s of the 300s maxDuration for the trailing past-card rewarm
+        # (which has its own 40s budget) + FastAPI/network slop.
+        deadline = time.time() + 200
+        days = max(1, min(int(days_back or 14), 30))
+        changed_dates = {}
+        scanned_games = 0
+        all_affected = set()
+        swept_dates = []
+        for date_str in _recent_dates_for_stat_corrections(days):
+            if time.time() >= deadline:
+                print(f"[StatCorrections] Deadline hit - scanned {scanned_games} games / {len(changed_dates)} changed dates, deferring rest")
+                break
+            swept_dates.append(date_str)
+            game_pks = _final_game_pks_for_date(date_str)
+            scanned_games += len(game_pks)
+            result = check_boxscore_stat_corrections(game_pks)
+            affected = result.get("affected_pitchers") or []
+            corrections = result.get("corrections") or []
+            if not corrections:
+                continue
+            clear_cache(date_str, pitcher_ids=affected)
+            all_affected.update(int(p) for p in affected)
+            changed_dates[date_str] = {
+                "affected_pitchers": affected,
+                "corrections": corrections,
+            }
+
+        # Box-score levels: no pitch lines to diff, so just invalidate their
+        # daily caches for the swept window and let them rebuild on demand.
+        box_cleared = 0
+        for date_str in swept_dates:
+            for code in LEVEL_ORDER:
+                if code in STATCAST_LEVELS:
+                    continue
+                key = f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{date_str}"
+                try:
+                    redis_delete(f"agg:{key}")
+                    box_cleared += 1
+                except Exception:
+                    pass
+
+        rewarm_stats = {"warmed": 0, "skipped": 0, "budget_hit": False}
+        if all_affected:
+            try:
+                today_str = _now_et().strftime("%Y-%m-%d")
+                rewarm_stats = _rewarm_past_cards_for_pitchers(
+                    all_affected, today_str, deadline=time.time() + 40,
+                )
+            except Exception as e:
+                print(f"[StatCorrections] Past-card rewarm error: {e}")
+
+        return {
+            "status": "ok",
+            "days_back": days,
+            "scanned_games": scanned_games,
+            "changed_dates": changed_dates,
+            "box_caches_cleared": box_cleared,
+            "past_cards_rewarmed": rewarm_stats.get("warmed", 0),
+            "past_cards_rewarm_budget_hit": rewarm_stats.get("budget_hit", False),
+        }
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup-daily")
+def cron_warmup_daily(request: Request, response: Response):
+    """Daily cron (8:00 UTC = 4:00 AM EDT): warms the homepage caches for the
+    default date at EVERY level. Scheduled before the 5 AM ET date rollover so
+    get_default_date() still resolves to the just-completed slate."""
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 240
+        default_date = get_default_date()
+        warmed, skipped = [], []
+        for code in LEVEL_ORDER:
+            if time.time() >= deadline:
+                skipped.append(code)
+                continue
+            try:
+                get_games(default_date, code)
+                if is_statcast_level(code):
+                    fetch_date(default_date)
+                    pd_result = aggregate_pitch_data(default_date, None, level=code)
+                    set_agg_cache(f"daily_pitch_{code}_{default_date}", pd_result)
+                    pr_result = aggregate_pitcher_results(default_date, None, level=code)
+                    set_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}", pr_result)
+                else:
+                    rows = get_level_results(default_date, code)
+                    if rows:
+                        set_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{default_date}", rows)
+                warmed.append(code)
+            except Exception as e:
+                print(f"[WarmupDaily] {code} failed: {e}")
+                skipped.append(code)
+        record_stat_lines_refresh(default_date)
+        print(f"[WarmupDaily] {default_date}: warmed {warmed}, skipped {skipped}")
+        try:
+            sl_start = _season_start(_now_et().year)
+            totals_end = _resolve_end_date("")
+            fetch_all_pitchers_list_materialized(sl_start, totals_end)
+        except Exception as e:
+            print(f"[WarmupDaily] Pitcher list warm error: {e}")
+        now = _now_et().isoformat()
+        redis_set("last_refresh", now)
+        return {"status": "ok", "timestamp": now, "date": default_date,
+                "levels_warmed": warmed, "levels_skipped": skipped}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup-daily-2")
+def cron_warmup_daily_season(request: Request, response: Response):
+    """Season-wide org aggregations (4:05 AM ET).
+
+    Org pages are the expensive page in this build: 30 orgs x ~7 affiliates.
+    The AAA block comes from the materialized range; every other affiliate is
+    one season-stats call. `offset` lets the job be split across runs if the
+    full sweep ever outgrows the 300s budget.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 260
+        start_date = _season_start(_now_et().year)
+        end_date = _resolve_end_date("")
+        df = fetch_date_range_materialized(start_date, end_date)
+        if df is None:
+            # Range not materialized yet — queue it and let the materialize
+            # cron pick it up rather than doing a blocking season fetch here.
+            queue_range_materialization(start_date, end_date)
+            return {"status": "deferred", "reason": "range not materialized",
+                    "start_date": start_date, "end_date": end_date}
+
+        # Per-affiliate AAA team aggregations (same shape as the MLB app's).
+        if "pitcher_team" in df.columns:
+            for team in df["pitcher_team"].dropna().unique():
+                if time.time() >= deadline:
+                    break
+                tdf = df[df["pitcher_team"] == team]
+                if tdf.empty:
+                    continue
+                set_agg_cache(f"team_{team}_results_{start_date}_{end_date}",
+                              aggregate_pitcher_results_range(tdf))
+                set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}",
+                              aggregate_pitch_data_range(tdf))
+
+        warmed_orgs, skipped_orgs = [], []
+        season_year = int(start_date[:4])
+        for org in all_orgs():
+            if time.time() >= deadline:
+                skipped_orgs.append(org)
+                continue
+            try:
+                for meta in affiliates_for_org(org):
+                    if meta["level"] == "AAA":
+                        continue  # comes from the materialized range above
+                    get_team_season_pitchers(meta["team_id"], meta["level"], season_year)
+                warmed_orgs.append(org)
+            except Exception as e:
+                print(f"[WarmupDaily2] org {org} failed: {e}")
+                skipped_orgs.append(org)
+
+        return {"status": "ok", "orgs_warmed": len(warmed_orgs),
+                "orgs_skipped": skipped_orgs,
+                "budget_hit": bool(skipped_orgs)}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup-daily-players")
+def cron_warmup_daily_players(request: Request, response: Response):
+    """Player pages for everyone who pitched yesterday, at ANY level (4:15 AM ET).
+
+    Pulls the pitcher set from every level's results, not just AAA — a AA-only
+    pitcher has a player page too, and it is the slowest one to build cold
+    (6 gameLog calls).
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 250
+        default_date = get_default_date()
+        season_start_str = _season_start(_now_et().year)
+        end_date = _resolve_end_date("")
+
+        pitcher_ids = set()
+        for code in LEVEL_ORDER:
+            if time.time() >= deadline:
+                break
+            try:
+                if is_statcast_level(code):
+                    rows = get_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
+                        or aggregate_pitcher_results(default_date, None, level=code)
+                else:
+                    rows = get_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
+                        or get_level_results(default_date, code)
+                pitcher_ids.update(int(r["pitcher_id"]) for r in (rows or []) if r.get("pitcher_id"))
+            except Exception as e:
+                print(f"[WarmupDailyPlayers] {code} results failed: {e}")
+
+        # Today's probable starters too, so the first card view of a pitcher who
+        # didn't appear yesterday still hits a warm cache.
+        for code in STATCAST_LEVELS:
+            try:
+                pitcher_ids.update(get_probable_starter_ids(default_date, level=code))
+            except Exception:
+                pass
+
+        stats = _warm_player_page_cache_for_pitchers(
+            pitcher_ids, season_start_str, end_date, deadline=deadline,
+        )
+        return {"status": "ok", "date": default_date,
+                "pitchers": len(pitcher_ids), **(stats or {})}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup-daily-cards")
+def cron_warmup_daily_cards(request: Request, response: Response):
+    """Pre-compute game cards (4:30 AM ET).
+
+    Cards exist only for AAA and AFL, so this never touches the other levels —
+    warming them would burn the whole budget building payloads no page renders.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 260
+        default_date = get_default_date()
+        warmed, failed = 0, 0
+        for code in STATCAST_LEVELS:
+            rows = get_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
+                or aggregate_pitcher_results(default_date, None, level=code)
+            for r in (rows or []):
+                if time.time() >= deadline:
+                    print(f"[WarmupDailyCards] Deadline hit after {warmed} cards")
+                    return {"status": "ok", "date": default_date, "cards_warmed": warmed,
+                            "failed": failed, "budget_hit": True}
+                pid, gpk = r.get("pitcher_id"), r.get("game_pk")
+                if pid is None or gpk is None:
+                    continue
+                try:
+                    payload = _build_pitcher_card_payload(default_date, int(pid), int(gpk))
+                    if payload:
+                        agg_key = (
+                            f"card_{default_date}_{int(pid)}_{int(gpk)}"
+                            f"_v{get_override_version()}_s{CARD_SCHEMA_VERSION}"
+                        )
+                        set_agg_cache(agg_key, payload)
+                        warmed += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"[WarmupDailyCards] card {pid}/{gpk} failed: {e}")
+        return {"status": "ok", "date": default_date, "cards_warmed": warmed,
+                "failed": failed, "budget_hit": False}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+def _live_games_for_statcast_levels(today: str):
+    """Live/in-progress games across AAA + AFL only."""
+    live = []
+    for code in STATCAST_LEVELS:
+        for g in (get_games(today, code) or []):
+            if g.get("abstract_state") == "Live" or g.get("status") in ("In Progress", "Manager challenge"):
+                live.append((code, g))
+    return live
+
+
+@app.get("/api/cron/warmup-live-cards")
+def cron_warmup_live_cards(request: Request, response: Response):
+    """Refresh cards for in-progress games every 10 min during game hours.
+
+    AAA + AFL only — the other levels have no cards to refresh.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 260
+        today = get_default_date()
+        live = _live_games_for_statcast_levels(today)
+        if not live:
+            return {"status": "ok", "date": today, "live_games": 0, "warmed": 0}
+        warmed, failed = 0, 0
+        for code, game in live:
+            if time.time() >= deadline:
+                break
+            gpk = int(game["game_pk"])
+            try:
+                rows = aggregate_pitcher_results(today, gpk, level=code)
+            except Exception as e:
+                print(f"[LiveCards] results failed for {gpk}: {e}")
+                continue
+            for r in (rows or []):
+                if time.time() >= deadline:
+                    break
+                pid = r.get("pitcher_id")
+                if pid is None:
+                    continue
+                # Skip pitchers still mid-inning: their line is about to change
+                # anyway, so caching it just burns budget on a stale payload.
+                try:
+                    if not _pitcher_half_inning_settled(gpk, int(pid)):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    payload = _build_pitcher_card_payload(today, int(pid), gpk)
+                    if payload:
+                        agg_key = (
+                            f"card_{today}_{int(pid)}_{gpk}"
+                            f"_v{get_override_version()}_s{CARD_SCHEMA_VERSION}"
+                        )
+                        set_agg_cache(agg_key, payload)
+                        warmed += 1
+                except Exception as e:
+                    failed += 1
+                    print(f"[LiveCards] card {pid}/{gpk} failed: {e}")
+        return {"status": "ok", "date": today, "live_games": len(live),
+                "warmed": warmed, "failed": failed}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/warmup-live-game-views")
+def cron_warmup_live_game_views(request: Request, response: Response):
+    """Refresh the per-game tables for in-progress games every 2 min.
+
+    AAA + AFL only, and the cache key carries the level so an AAA and an AFL
+    game on the same date can't collide.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 260
+        today = get_default_date()
+        live = _live_games_for_statcast_levels(today)
+        warmed, skipped_empty = 0, 0
+        for code, game in live:
+            if time.time() >= deadline:
+                break
+            gpk = int(game["game_pk"])
+            agg_key = (
+                f"game_view_{code}_{today}_{gpk}"
+                f"_v{get_override_version()}_s{CARD_SCHEMA_VERSION}"
+            )
+            try:
+                payload = _build_selected_game_payload(today, gpk)
+                if payload.get("pitchData") or payload.get("resultsData"):
+                    set_agg_cache(agg_key, payload)
+                    warmed += 1
+                else:
+                    skipped_empty += 1
+            except Exception as e:
+                print(f"[LiveGameViews] Game error {gpk}: {e}")
+        return {
+            "status": "ok",
+            "date": today,
+            "live_games": len(live),
+            "warmed": warmed,
+            "skipped_empty": skipped_empty,
+        }
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 
 
 @app.post("/api/refresh")

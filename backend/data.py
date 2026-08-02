@@ -1490,53 +1490,38 @@ def _materialize_status_key(start_date, end_date):
     return f"materialize:status:{start_date}:{end_date}"
 
 
-# Materialization runs IN-PROCESS on this local-only build. Upstream, a range
-# was queued into Redis and drained later by a Vercel cron; with the crons gone
-# (and Redis optional locally) that queue would never drain, leaving every
-# season-range endpoint stuck on a permanent 202 "rebuilding". The uvicorn
-# process is long-lived, so a background thread per range does the same job with
-# no external scheduler. Status lives in this dict, not Redis.
-_materialize_jobs = {}  # { "start:end": {"status": "pending"|"running"|"ready"|"error", "error"?: str} }
-_materialize_lock = threading.Lock()
-
-
+# Materialization is QUEUED into Redis and drained by the
+# /api/cron/materialize-ranges cron. It cannot run in a background thread here:
+# a Vercel function is frozen once its response is sent, so the thread may never
+# finish, and per-instance state would be invisible to the next invocation.
 def get_range_materialization_status(start_date, end_date):
-    token = _materialize_range_token(start_date, end_date)
-    with _materialize_lock:
-        status = _materialize_jobs.get(token)
+    status = redis_get(_materialize_status_key(start_date, end_date))
     if status:
-        return dict(status)
+        return status
     if fetch_date_range_materialized(start_date, end_date) is not None:
         return {"status": "ready"}
+    if not redis_available():
+        return {"status": "error", "error": "Season cache rebuild is unavailable because Redis is not configured."}
     return {"status": "pending"}
 
 
-def _run_materialization(start_date, end_date, token):
-    try:
-        fetch_date_range(start_date, end_date)
-        result = {"status": "ready"}
-    except Exception as e:
-        result = {"status": "error", "error": str(e)[:500]}
-        print(f"[Materialize] {token} failed: {e}")
-    with _materialize_lock:
-        _materialize_jobs[token] = result
-
-
 def queue_range_materialization(start_date, end_date):
-    token = _materialize_range_token(start_date, end_date)
     if fetch_date_range_materialized(start_date, end_date) is not None:
-        with _materialize_lock:
-            _materialize_jobs[token] = {"status": "ready"}
+        redis_set(_materialize_status_key(start_date, end_date), {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
         return {"status": "ready", "queued": False}
-    with _materialize_lock:
-        current = _materialize_jobs.get(token) or {}
-        if current.get("status") in ("pending", "running"):
-            return {**current, "queued": False}
-        _materialize_jobs[token] = {"status": "running"}
-    threading.Thread(
-        target=_run_materialization, args=(start_date, end_date, token), daemon=True
-    ).start()
-    return {"status": "running", "queued": True}
+    if not redis_available():
+        return {
+            "status": "error",
+            "queued": False,
+            "error": "Season cache rebuild is unavailable because Redis is not configured.",
+        }
+    current = redis_get(_materialize_status_key(start_date, end_date)) or {}
+    if current.get("status") in ("pending", "running"):
+        return {**current, "queued": False}
+    payload = {"status": "pending"}
+    redis_set(_materialize_status_key(start_date, end_date), payload, ttl=MATERIALIZE_STATUS_TTL)
+    redis_sadd(MATERIALIZE_PENDING_KEY, _materialize_range_token(start_date, end_date), ttl=MATERIALIZE_STATUS_TTL)
+    return {**payload, "queued": True}
 
 
 def _df_to_records(df):
@@ -1800,6 +1785,31 @@ def fetch_date_range_materialized(start_date, end_date):
             persisted = persisted.drop_duplicates(subset=["game_pk", "at_bat_number", "pitch_number"], keep="first")
     _range_cache[cache_key] = (time.time(), persisted)
     return _merge_daily_cache(persisted, start_date, end_date)
+
+
+def drain_pending_materializations(max_jobs=1):
+    """Drain Redis-backed materialization jobs. Intended for cron/manual triggers."""
+    tokens = sorted(redis_smembers(MATERIALIZE_PENDING_KEY))
+    drained = []
+    for token in tokens[:max(1, int(max_jobs or 1))]:
+        try:
+            start_date, end_date = token.split(":", 1)
+        except ValueError:
+            redis_srem(MATERIALIZE_PENDING_KEY, token)
+            continue
+        status_key = _materialize_status_key(start_date, end_date)
+        redis_set(status_key, {"status": "running"}, ttl=MATERIALIZE_STATUS_TTL)
+        try:
+            fetch_date_range(start_date, end_date)
+            redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
+            redis_srem(MATERIALIZE_PENDING_KEY, token)
+            drained.append({"start_date": start_date, "end_date": end_date, "status": "ready"})
+        except Exception as e:
+            message = str(e)[:500]
+            redis_set(status_key, {"status": "error", "error": message}, ttl=MATERIALIZE_STATUS_TTL)
+            redis_srem(MATERIALIZE_PENDING_KEY, token)
+            drained.append({"start_date": start_date, "end_date": end_date, "status": "error", "error": message})
+    return drained
 
 
 def prefetch_boxscores(df, deadline=None):

@@ -1,0 +1,4 @@
+[
+  { "pitcher": "Test Starter", "pitcher_id": 600001, "team": "NYY", "hand": "R", "role": "SP", "game_pk": 777001, "ip": "6.0", "er": 1, "hits": 4, "bbs": 1, "ks": 8, "hrs": 1, "whiffs": 14, "csw_pct": 30.1, "strike_pct": 64.0, "pitches": 92 },
+  { "pitcher": "Test Reliever", "pitcher_id": 600002, "team": "NYY", "hand": "L", "role": "RP", "game_pk": 777001, "ip": "1.1", "er": 0, "hits": 1, "bbs": 0, "ks": 2, "hrs": 0, "whiffs": 3, "csw_pct": 33.3, "strike_pct": 66.0, "pitches": 18 }
+]

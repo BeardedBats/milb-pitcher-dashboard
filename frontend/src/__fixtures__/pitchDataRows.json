@@ -1,0 +1,5 @@
+[
+  { "pitch_name": "Four-Seamer", "count": 42, "velo": 95.3, "ivb": 16.2, "ihb": -8.1, "ext": 6.4, "usage": 48.3, "cs_pct": 18.0, "swstr_pct": 11.9, "csw_pct": 29.9, "strike_pct": 64.0, "vs_r": 55.0, "vs_l": 41.0 },
+  { "pitch_name": "Slider", "count": 28, "velo": 86.1, "ivb": 2.4, "ihb": 6.0, "ext": 6.3, "usage": 32.2, "cs_pct": 9.0, "swstr_pct": 19.6, "csw_pct": 28.6, "strike_pct": 60.0, "vs_r": 31.0, "vs_l": 33.0 },
+  { "pitch_name": "Changeup", "count": 17, "velo": 88.0, "ivb": 8.1, "ihb": -12.0, "ext": 6.5, "usage": 19.5, "cs_pct": 5.0, "swstr_pct": 23.5, "csw_pct": 28.5, "strike_pct": 58.0, "vs_r": 14.0, "vs_l": 26.0 }
+]

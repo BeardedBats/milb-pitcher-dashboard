@@ -1,0 +1,36 @@
+node_modules/
+dist/
+output/
+public/
+frontend-build/
+frontend/build/
+backend/dist/
+backend/build/
+backend/__pycache__/
+backend/*.spec
+__pycache__/
+*.pyc
+.env
+
+# Large archives
+*.rar
+*.zip
+
+# Legacy / test files
+Old/
+strikezone-comparison.html
+batter-preview.html
+batter-test2.html
+test-alignment.html
+title-options.html
+Savant Dashboard design-system.html
+
+# Generated docs (send separately)
+*.docx
+
+.vercel
+
+# Local shortcuts / scratch
+*.lnk
+HTML Tests/
+.env*

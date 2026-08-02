@@ -1,0 +1,4 @@
+[
+  { "pitcher": "Test Starter", "pitcher_id": 600001, "hand": "R", "games": 12, "ip": "74.1", "hits": 60, "bbs": 18, "ks": 84, "er": 28, "hrs": 9, "csw_pct": 29.4, "whiffs": 150, "pitches": 1180 },
+  { "pitcher": "Test Reliever", "pitcher_id": 600002, "hand": "L", "games": 30, "ip": "31.2", "hits": 24, "bbs": 12, "ks": 40, "er": 11, "hrs": 3, "csw_pct": 31.0, "whiffs": 70, "pitches": 520 }
+]

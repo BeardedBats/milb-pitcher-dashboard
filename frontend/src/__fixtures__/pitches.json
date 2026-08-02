@@ -1,0 +1,8 @@
+[
+  { "pitch_name": "Four-Seamer", "description": "swinging_strike", "events": "", "stand": "R", "balls": 0, "strikes": 2, "game_pk": 777001, "at_bat_number": 1, "pitch_number": 3, "inning": 1, "plate_x": 0.1, "plate_z": 2.5, "launch_speed": null, "launch_angle": null },
+  { "pitch_name": "Slider", "description": "called_strike", "events": "", "stand": "L", "balls": 1, "strikes": 1, "game_pk": 777001, "at_bat_number": 2, "pitch_number": 2, "inning": 1, "plate_x": -0.3, "plate_z": 2.1 },
+  { "pitch_name": "Four-Seamer", "description": "hit_into_play", "events": "home_run", "stand": "R", "balls": 2, "strikes": 1, "game_pk": 777001, "at_bat_number": 3, "pitch_number": 4, "inning": 2, "launch_speed": 104.2, "launch_angle": 28, "runs_scored": 1 },
+  { "pitch_name": "Changeup", "description": "ball", "events": "", "stand": "L", "balls": 3, "strikes": 1, "game_pk": 777001, "at_bat_number": 4, "pitch_number": 5, "inning": 2 },
+  { "pitch_name": "Slider", "description": "foul", "events": "", "stand": "R", "balls": 0, "strikes": 1, "game_pk": 777001, "at_bat_number": 5, "pitch_number": 2, "inning": 3 },
+  { "pitch_name": "Four-Seamer", "description": "hit_into_play", "events": "field_out", "stand": "R", "balls": 1, "strikes": 2, "game_pk": 777001, "at_bat_number": 6, "pitch_number": 4, "inning": 3, "launch_speed": 78.0, "launch_angle": 5 }
+]

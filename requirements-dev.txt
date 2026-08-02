@@ -1,0 +1,6 @@
+# Local development extras on top of the canonical runtime set
+-r backend/requirements.txt
+uvicorn[standard]==0.41.0
+pytest==9.0.3
+httpx==0.28.1
+

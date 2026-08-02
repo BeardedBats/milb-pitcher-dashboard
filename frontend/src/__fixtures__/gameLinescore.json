@@ -1,0 +1,20 @@
+{
+  "away_team": "BOS",
+  "home_team": "NYY",
+  "is_final": true,
+  "innings": [
+    { "num": 1, "away": { "runs": 0 }, "home": { "runs": 1 } },
+    { "num": 2, "away": { "runs": 0 }, "home": { "runs": 0 } },
+    { "num": 3, "away": { "runs": 1 }, "home": { "runs": 0 } }
+  ],
+  "totals": { "away": { "runs": 1 }, "home": { "runs": 1 } },
+  "plays": [
+    {
+      "inning": 1,
+      "top": false,
+      "pas": [
+        { "pitcher_id": 600001, "pitcher": "Test Starter", "batter": "Slugger A", "result": "home_run", "outs": 0, "stand": "R", "away_score": 0, "home_score": 1, "rbi": 1, "pitches": [] }
+      ]
+    }
+  ]
+}

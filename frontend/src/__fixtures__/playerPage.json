@@ -1,0 +1,17 @@
+{
+  "info": { "name": "Test Starter", "hand": "R", "teams": ["NYY"] },
+  "schedule": { "starts": [] },
+  "season_averages": { "previous": {}, "previous_season": 2025 },
+  "game_log": [
+    { "game_pk": 777001, "date": "2026-06-10", "team": "NYY", "opponent": "BOS", "home_team": "NYY", "ip": "6.0", "hits": 4, "bbs": 1, "ks": 8, "hrs": 1, "er": 1, "runs": 1, "pitches": 92, "pa_count": 24, "two_strike_pas": 12, "whiffs": 14, "strikes": 59, "csw_pct": 30.1, "games_started": 1, "decision": "W" },
+    { "game_pk": 777050, "date": "2026-06-15", "team": "NYY", "opponent": "TBR", "home_team": "TBR", "ip": "5.2", "hits": 6, "bbs": 2, "ks": 6, "hrs": 0, "er": 2, "runs": 2, "pitches": 88, "pa_count": 23, "two_strike_pas": 9, "whiffs": 10, "strikes": 55, "csw_pct": 27.3, "games_started": 1, "decision": "L" }
+  ],
+  "pitch_summary": [
+    { "pitch_name": "Four-Seamer", "count": 42 },
+    { "pitch_name": "Slider", "count": 28 }
+  ],
+  "pitches": [
+    { "pitch_name": "Four-Seamer", "description": "swinging_strike", "events": "", "stand": "R", "game_pk": 777001, "at_bat_number": 1, "pitch_number": 3 },
+    { "pitch_name": "Slider", "description": "called_strike", "events": "", "stand": "L", "game_pk": 777001, "at_bat_number": 2, "pitch_number": 2 }
+  ]
+}

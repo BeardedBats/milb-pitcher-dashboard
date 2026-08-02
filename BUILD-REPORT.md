@@ -6,9 +6,10 @@ A fork of the MLB Pitcher Dashboard, converted to cover minor-league pitchers
 Built in five gated phases. Every gate below was executed against the running
 app, not reasoned about.
 
-> **Branches.** `main` is the local-only build described below — no Vercel, no
-> crons, in-process materialization. `vercel-deploy` adds serverless hosting on
-> Vercel + Upstash; see "Deployment (vercel-deploy branch)" at the end.
+> **Status.** Phases 1–5 below built this as a local-only app. It was
+> subsequently deployed to Vercel + Upstash — see "Deployment" at the end for
+> what that changed. `main` is now the deployed branch; local dev still works
+> unchanged.
 
 ---
 
@@ -271,10 +272,10 @@ cd frontend && npx react-scripts build
 
 ---
 
-## Deployment (vercel-deploy branch)
+## Deployment
 
-This branch makes the app deployable on Vercel + Upstash. `main` stays
-local-only; nothing here is merged back unless the deploy is wanted.
+The app is hosted on Vercel + Upstash. This section records what had to change
+from the local-only build to make that work.
 
 ### The three rewrites that had to be undone
 

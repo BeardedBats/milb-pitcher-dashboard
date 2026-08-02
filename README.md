@@ -1,14 +1,15 @@
-# MiLB Pitcher Dashboard (Vercel branch)
+# MiLB Pitcher Dashboard
 
-Staff-facing **minor-league** pitcher stats dashboard for PitcherList — a local-only fork of the MLB Pitcher Dashboard covering Triple-A through Rookie ball plus the Arizona Fall League. Game cards, season totals, strike-zone plots, velocity trends and play-by-play for the levels that have Statcast; box-score tables for the ones that don't.
+Staff-facing **minor-league** pitcher stats dashboard for PitcherList — a fork of the MLB Pitcher Dashboard covering Triple-A through Rookie ball plus the Arizona Fall League. Game cards, season totals, strike-zone plots, velocity trends and play-by-play for the levels that have Statcast; box-score tables for the ones that don't.
 
-**This app is local-only and has no deploy target.** No Vercel, no crons, no Upstash, no CI. It never shows major-league games.
+It never shows major-league games.
 
 ## Stack
 
-- **Frontend:** React 18 on Create React App (`react-scripts`), port 3847
-- **Backend:** Python FastAPI on uvicorn, port 8000
-- **Cache:** per-process in-memory L1 (Upstash Redis L2 is still supported if the env vars happen to be set, but nothing requires it)
+- **Frontend:** React 18 on Create React App (`react-scripts`), port 3847 in dev
+- **Backend:** Python FastAPI — uvicorn locally, one Vercel serverless function (`api/index.py`) in production
+- **Cache:** per-process in-memory L1 + Upstash Redis L2 (`backend/redis_cache.py`)
+- **Jobs:** 9 Vercel crons (schedules in `vercel.json`) for warmup and range materialization, authenticated with `CRON_SECRET`
 - **Data:** Baseball Savant minor-league Statcast (`/statcast-search-minors/csv` with `minors=true`) + the MLB Stats API (schedules, box scores, live feeds, per-level game logs)
 
 ## Levels
@@ -24,7 +25,25 @@ Staff-facing **minor-league** pitcher stats dashboard for PitcherList — a loca
 
 `backend/levels.py` is the single source of truth for this table, the MLB parent-org map, and `(org, level)` team display names.
 
-## Running it
+## Deployment
+
+Hosted on Vercel (Pitcher List team) at `milb-pitcher-dashboard.vercel.app`, backed by Upstash Redis. Pushing to `main` auto-deploys to production; branches get preview deployments.
+
+Requires Vercel **Pro** — `maxDuration: 300` and the sub-daily cron schedules are not available on Hobby.
+
+Env vars (Vercel → Settings → Environment Variables):
+
+| Var | Purpose |
+|---|---|
+| `UPSTASH_REDIS_REST_URL` | L2 cache — REST URL, not the `redis://` string |
+| `UPSTASH_REDIS_REST_TOKEN` | L2 cache |
+| `CRON_SECRET` | Bearer token the cron + `/api/materialize-*` endpoints require. Vercel sends it automatically on cron invocations. |
+
+Without Redis the app still serves (L1-only), but season-range endpoints will report the cache as unavailable.
+
+**Gotcha:** `vercel.json` must exist in the deployed branch. A branch without it builds to an empty output in ~99ms and still reports READY — the import screen's suggested multi-service config is only a proposal and does nothing unless committed.
+
+## Running it locally
 
 Double-click **`MiLB Pitcher Dashboard.vbs`** (starts both servers hidden, then opens the browser) or **`start-dashboard.bat`** (starts both in minimized windows).
 
@@ -46,7 +65,7 @@ Frontend (port 3847), in a second terminal:
 cd frontend && npm install && npm start
 ```
 
-The frontend talks to `http://localhost:8000` in dev. On startup the backend kicks off a background warmup that pulls the season's AAA Statcast — the homepage works immediately, but org/team pages and season-context columns fill in once it finishes (a few minutes on a cold run).
+The frontend talks to `http://localhost:8000` in dev; in production the API is same-origin via the Vercel rewrite. On startup the backend kicks off a background warmup that pulls the season's AAA Statcast — the homepage works immediately, but org/team pages and season-context columns fill in once it finishes (a few minutes on a cold run). That warmup is skipped on Vercel (`_IS_SERVERLESS`); the crons handle it there.
 
 Both servers use the same ports as the MLB dashboard, so run only one of the two at a time.
 

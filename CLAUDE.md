@@ -1,17 +1,28 @@
 # MiLB Pitcher Dashboard
 
-Local-only fork of the MLB Pitcher Dashboard covering MINOR-league pitchers.
+Fork of the MLB Pitcher Dashboard covering MINOR-league pitchers.
 See BUILD-REPORT.md for what the fork changed and DECISIONS.md for why.
 
 ## Tech Stack
-- Frontend: React 18 (Create React App), port 3847
-- Backend: Python FastAPI on uvicorn, port 8000
+- Frontend: React 18 (Create React App), port 3847 in dev
+- Backend: Python FastAPI — uvicorn locally, ONE Vercel serverless function (`api/index.py`) in production behind the `/api/*` rewrite
 
-## Runtime — LOCAL ONLY
-- **No deploy target.** No Vercel, no `vercel.json`, no `api/index.py`, no crons, no GitHub Actions, no `.vercelignore`. Never push to a remote, never deploy, never set Upstash/Vercel env vars.
-- Launchers: `MiLB Pitcher Dashboard.vbs` (hidden + opens browser) and `start-dashboard.bat` (minimized windows). Both use distinct window titles. Ports match the MLB dashboard, so run only one of the two at a time.
-- Cache: per-process in-memory dict (L1); Upstash Redis (L2, `backend/redis_cache.py`) still works if env vars exist but nothing depends on it. `CARD_SCHEMA_VERSION` in `backend/data.py` is embedded in cache keys — bump it whenever cached payload shape or cache semantics change, and add a line to its changelog comment.
-- Range materialization runs **in-process** (`data.queue_range_materialization` spawns a thread); there is no cron to drain a queue.
+## Runtime
+- Repo: `BeardedBats/milb-pitcher-dashboard` (private). Hosted on Vercel (Pitcher List team) + Upstash Redis. Pushing `main` auto-deploys to production; branches get previews. **Requires Vercel Pro** — `maxDuration: 300` and sub-daily crons are Pro-only.
+- Env vars: `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, `CRON_SECRET`.
+- **`vercel.json` MUST exist in the deployed branch.** A branch without it builds to an empty output in ~99ms and still reports READY — a silent no-op deploy. The import screen's suggested multi-service config is only a proposal and does nothing unless committed.
+- Local launchers: `MiLB Pitcher Dashboard.vbs` (hidden + opens browser) and `start-dashboard.bat` (minimized windows). Ports match the MLB dashboard, so run only one of the two at a time.
+- Cache: per-process in-memory dict (L1) + Upstash Redis (L2, `backend/redis_cache.py`). `CARD_SCHEMA_VERSION` in `backend/data.py` is embedded in cache keys — bump it whenever cached payload shape or cache semantics change, and add a line to its changelog comment.
+- Range materialization is **queued into Redis** and drained by `/api/cron/materialize-ranges`. Do NOT convert this to a background thread: a Vercel function is frozen once its response is sent, so the thread may never finish and its status would be invisible to the next invocation.
+- `on_startup` warms only when `_IS_SERVERLESS` is false. Never remove that guard — on Vercel it would start a full-season Savant fetch on every cold start.
+- `backend/boxscore_levels.py` caches are two-tier (L1 dict + Redis via `_two_tier`). Cache DERIVED rows, never raw box scores — a full slate of raw payloads exceeds Upstash's per-request limit.
+
+## Crons (9, in `vercel.json`)
+Level-aware — the MLB originals assumed one slate a day.
+- Daily jobs run 07:00–08:20 UTC at 20-min spacing. Two constraints: each job does ~6x the work now, and 09:00 UTC is 5:00 AM EDT, exactly the `get_default_date()` rollover, where a job would warm the wrong slate.
+- `warmup-daily` loops all 6 levels under a deadline; `warmup-daily-cards` and both live crons are AAA+AFL only (no cards exist elsewhere).
+- `_final_game_pks_for_date` must never hardcode `sportId=1`.
+- Cron + `/api/materialize-*` endpoints fail CLOSED: unset `CRON_SECRET` means 401, not open.
 
 ## Levels — the core concept
 `backend/levels.py` owns the level registry, the MLB parent-org map, and `(org, level)` team display names. Nothing else hardcodes a sportId.

@@ -1,10 +1,14 @@
 # BUILD REPORT — MiLB Pitcher Dashboard
 
-A local-only fork of the MLB Pitcher Dashboard, converted to cover minor-league
-pitchers (AAA through Rookie, plus the Arizona Fall League) and nothing else.
+A fork of the MLB Pitcher Dashboard, converted to cover minor-league pitchers
+(AAA through Rookie, plus the Arizona Fall League) and nothing else.
 
 Built in five gated phases. Every gate below was executed against the running
 app, not reasoned about.
+
+> **Branches.** `main` is the local-only build described below — no Vercel, no
+> crons, in-process materialization. `vercel-deploy` adds serverless hosting on
+> Vercel + Upstash; see "Deployment (vercel-deploy branch)" at the end.
 
 ---
 
@@ -264,3 +268,55 @@ python -m pytest backend/tests -q
 ```bash
 cd frontend && npx react-scripts build
 ```
+
+---
+
+## Deployment (vercel-deploy branch)
+
+This branch makes the app deployable on Vercel + Upstash. `main` stays
+local-only; nothing here is merged back unless the deploy is wanted.
+
+### The three rewrites that had to be undone
+
+Each of these worked locally and would have failed **silently** on serverless —
+no error, just wrong or absent behavior.
+
+| Local-only build | Why it breaks on Vercel | Fix |
+|---|---|---|
+| Materialization ran in a `threading.Thread` | The function is frozen once its response is sent, so the thread may never finish; status lived in a per-instance dict the next invocation can't see | Redis queue + `drain_pending_materializations`, drained by `/api/cron/materialize-ranges` |
+| `on_startup` called `start_warmup()` unconditionally | Every cold start would begin a full-season Savant fetch across all Statcast levels | `_IS_SERVERLESS` guard restored |
+| `boxscore_levels` caches were module-level dicts | Every cold start re-ran 6 gameLog calls per player page and one request per affiliate per org page | All four caches are L1 dict + Redis L2 |
+
+The cache rework stores **derived rows** rather than raw payloads: a box score
+is hundreds of KB and would exceed Upstash's per-request limit for a full slate,
+while one game's adapted rows are a few KB. Final games cache for a day, live
+games for a minute.
+
+### Level-aware crons
+
+The MLB crons assumed one slate a day. Six levels changes that:
+
+- `_final_game_pks_for_date` no longer hardcodes `sportId=1` — it sweeps the Statcast levels
+- `warmup-daily` loops all six levels under a deadline; Statcast levels get pitch + results, the rest get the box-score table
+- `warmup-daily-2` warms per-affiliate season stats across all 30 orgs (org pages are the expensive page in this build)
+- `warmup-daily-players` collects pitchers from every level, not just AAA
+- `warmup-daily-cards` and both live crons are restricted to AAA + AFL, where cards exist at all
+- `stat-corrections` drops the box-score levels' daily caches for the swept window (they have no pitch lines to diff)
+- the `game_view` cache key carries the level
+
+### Schedule
+
+Daily jobs run 07:00–08:20 UTC at 20-minute spacing. Two constraints set that
+window: each job now does ~6x the work so the old 5-minute gaps would overlap,
+and 09:00 UTC is 5:00 AM EDT — exactly the `get_default_date()` rollover, where
+a job would warm the wrong slate. Live windows widened to `15-23,0-6` UTC to
+cover West Coast AAA.
+
+Requires Vercel **Pro**: the sub-daily schedules and `maxDuration: 300` are not
+available on Hobby.
+
+### Known deployment gotchas
+
+1. **`vercel.json` must be in the deployed branch.** Deploying `main` (which has none) produces an empty build — Vercel runs for ~99ms, writes no output, and reports READY. The import screen's suggested multi-service config is only a proposal; it does nothing unless committed.
+2. **`.gitignore` had a bare `public/`**, which also matched `frontend/public/` and kept `index.html` out of the repo. Any fresh clone failed with "Could not find a required file: index.html". Fixed on `main` in `7cb7b55` by anchoring the rule to `/public/`.
+3. **Deployment Protection** (team SSO) 302s every anonymous request. That is correct for an internal tool, and Vercel crons bypass it — but browser verification needs a protection-bypass token or a logged-in session.

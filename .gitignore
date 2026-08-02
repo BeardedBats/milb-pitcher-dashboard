@@ -1,7 +1,11 @@
 node_modules/
 dist/
 output/
-public/
+# Root-level build output only — MUST stay anchored. A bare `public/` also
+# matches frontend/public/, which holds index.html and favicon.ico; without
+# those the CRA build fails with "Could not find a required file: index.html"
+# on any fresh clone (and on Vercel).
+/public/
 frontend-build/
 frontend/build/
 backend/dist/

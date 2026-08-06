@@ -170,7 +170,12 @@ _override_version = 0  # Incremented on every save/remove to bust agg caches
 #      Gameday coordinates calibrated against AAA Savant), full contact quality
 #      (Soft/Med/Hard), spray (Pull/Center/Oppo) and per-batter-hand splits.
 #      Adapted rows and the multi-level game log both changed shape again.
-CARD_SCHEMA_VERSION = 46
+#   47: retires the s46 daily keys. s46 was written by a deploy whose
+#      per-game row cache still held v45 rows (that key was unversioned), so
+#      the v46 daily payloads were populated with the OLD metric shape and
+#      would never self-correct. _METRICS_VERSION now versions the per-game
+#      keys; this bump clears the daily ones they poisoned. Bump BOTH together.
+CARD_SCHEMA_VERSION = 47
 
 STAT_LINES_REFRESH_PREFIX = "stat_lines_refresh"
 RANGE_DAY_PREFIX = "range_day"

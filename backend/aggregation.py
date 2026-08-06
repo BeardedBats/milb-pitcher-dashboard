@@ -1149,6 +1149,235 @@ def aggregate_pitch_data_range(df, prepped=False):
     return results
 
 
+# ── Streaming range aggregation ────────────────────────────────────────────
+#
+# The functions above take ONE frame holding the whole range. For a season
+# that frame is ~612k pitch rows (order of 1.3 GB, with a transient 2x while
+# pd.concat builds it) against a 3009 MB function limit.
+#
+# These accumulate the same numbers a day at a time instead, so only one day is
+# resident. They work because every quantity involved is either a sum, a count,
+# or a set union — nothing needs to see the whole range at once. The two things
+# that would NOT survive being split are handled explicitly:
+#
+#   * Rates (usage, csw_pct, zone_pct, ...) are derived in the finalize step
+#     from merged totals. Averaging per-day percentages would be wrong.
+#   * Means (velo, ivb, ihb, ext, havaa) carry a (sum, count) pair rather than
+#     a mean, counting only non-NaN values so they match pandas' .mean().
+#
+# Grouping by game (games played, SP/RP role, boxscore ER/IP) is safe per day
+# because a game_pk belongs to exactly one game_date.
+
+
+def _mean_or_none(pair, scale=1.0, digits=1):
+    total, count = pair
+    if not count:
+        return None
+    return round(total / count * scale, digits)
+
+
+def _sum_pair(series):
+    """(sum, non-NaN count) — the additive form of a mean."""
+    return (float(series.sum()), int(series.count())) if series is not None else (0.0, 0)
+
+
+def _add_pair(acc, key, pair):
+    prev = acc[key]
+    acc[key] = (prev[0] + pair[0], prev[1] + pair[1])
+
+
+def new_results_accumulator():
+    return {}
+
+
+def accumulate_pitcher_results(acc, day_df):
+    """Fold one day into a pitcher-results accumulator."""
+    if day_df is None or day_df.empty:
+        return
+    df = day_df.copy()
+    df["is_whiff"] = df["description"].isin(_WHIFF_DESCS)
+    df["is_called_strike"] = df["description"] == "called_strike"
+
+    box_maps = _prefetch_boxscores_parallel([int(g) for g in df["game_pk"].unique()])
+
+    per_game_min_order = {}
+    if all(c in df.columns for c in ("at_bat_number", "pitcher_team", "game_pk")):
+        ao = df.groupby(["game_pk", "pitcher_team", "pitcher"])["at_bat_number"].min()
+        per_game_min_order = ao.groupby(level=[0, 1]).min().to_dict()
+
+    for (pitcher_id, name, hand), gdf in df.groupby(["pitcher", "player_name", "p_throws"]):
+        e = acc.setdefault((pitcher_id, name, hand), {
+            "pitches": 0, "whiffs": 0, "called_strikes": 0,
+            "teams": set(), "game_pks": set(),
+            "hits": 0, "bbs": 0, "ks": 0, "hrs": 0, "outs": 0,
+            "er": 0, "ip_thirds": 0, "use_box_ip": False,
+            "sp_games": 0, "rp_games": 0,
+        })
+        e["pitches"] += len(gdf)
+        e["whiffs"] += int(gdf["is_whiff"].sum())
+        e["called_strikes"] += int(gdf["is_called_strike"].sum())
+        if "pitcher_team" in gdf.columns:
+            e["teams"].update(gdf["pitcher_team"].dropna().unique())
+        if "game_pk" in gdf.columns:
+            e["game_pks"].update(int(g) for g in gdf["game_pk"].unique())
+
+        events_df = gdf.dropna(subset=["events"])
+        events_df = events_df[events_df["events"] != ""]
+        ev_col = events_df["events"] if not events_df.empty else pd.Series(dtype=str)
+        e["hits"] += int(ev_col.isin(_HIT_EVENTS).sum())
+        e["bbs"] += int(ev_col.isin(_BB_EVENTS).sum())
+        e["ks"] += int(ev_col.isin(_K_EVENTS).sum())
+        e["hrs"] += int(ev_col.isin(_HR_EVENTS).sum())
+        e["outs"] += _compute_outs_vectorized(ev_col)
+
+        for gpk in gdf["game_pk"].unique():
+            pbox = box_maps.get(int(gpk), {}).get(int(pitcher_id))
+            if pbox:
+                e["er"] += pbox.get("er", 0)
+                if pbox.get("ip") is not None:
+                    e["ip_thirds"] += _ip_to_outs(pbox["ip"])
+                    e["use_box_ip"] = True
+
+        if "at_bat_number" in gdf.columns:
+            for (gpk, pteam), pgdf in gdf.groupby(["game_pk", "pitcher_team"]):
+                team_min = per_game_min_order.get((gpk, pteam))
+                if team_min is not None and int(pgdf["at_bat_number"].min()) == int(team_min):
+                    e["sp_games"] += 1
+                else:
+                    e["rp_games"] += 1
+
+
+def finalize_pitcher_results(acc):
+    """Turn a merged accumulator into the same rows aggregate_pitcher_results_range returns."""
+    results = []
+    for (pitcher_id, name, hand), e in acc.items():
+        pitches = e["pitches"]
+        outs = e["ip_thirds"] if e["use_box_ip"] else e["outs"]
+        teams = sorted(e["teams"])
+        results.append({
+            "pitcher_id": int(pitcher_id),
+            "pitcher": name,
+            "team": teams[0] if len(teams) == 1 else "/".join(teams),
+            "hand": hand,
+            "games": len(e["game_pks"]),
+            "ip": f"{outs // 3}.{outs % 3}",
+            "hits": e["hits"], "bbs": e["bbs"], "ks": e["ks"], "hrs": e["hrs"],
+            "er": int(e["er"]),
+            "whiffs": e["whiffs"],
+            "csw_pct": round((e["called_strikes"] + e["whiffs"]) / pitches * 100, 2) if pitches else 0,
+            "pitches": pitches,
+            "role": "SP" if e["sp_games"] > e["rp_games"] else "RP",
+        })
+    results.sort(key=lambda r: r["pitches"], reverse=True)
+    return results
+
+
+def new_pitch_data_accumulator():
+    return {"groups": {}, "pitcher_totals": {}, "vs_r": {}, "vs_l": {}}
+
+
+def accumulate_pitch_data(acc, day_df, prepped=False):
+    """Fold one day into a pitch-data accumulator."""
+    if day_df is None or day_df.empty:
+        return
+    df = day_df if prepped else _prep_df(day_df)
+    if df.empty:
+        return
+
+    has_stand = "stand" in df.columns
+    has_strikes = "strikes" in df.columns
+    has_events = "events" in df.columns
+
+    for pid, sdf in df.groupby("pitcher"):
+        acc["pitcher_totals"][pid] = acc["pitcher_totals"].get(pid, 0) + len(sdf)
+        if has_stand:
+            acc["vs_r"][pid] = acc["vs_r"].get(pid, 0) + int((sdf["stand"] == "R").sum())
+            acc["vs_l"][pid] = acc["vs_l"].get(pid, 0) + int((sdf["stand"] == "L").sum())
+
+    grouped = df.groupby(["pitcher", "player_name", "p_throws", "pitch_name", "pitch_type"])
+    for key, gdf in grouped:
+        e = acc["groups"].setdefault(key, {
+            "count": 0, "in_zone": 0, "out_zone": 0, "whiffs": 0,
+            "called_strikes": 0, "strikes": 0, "o_swings": 0,
+            "two_str_pitches": 0, "two_str_ks": 0,
+            "vs_r": 0, "vs_l": 0, "teams": set(),
+            "velo": (0.0, 0), "ext": (0.0, 0), "ivb": (0.0, 0),
+            "ihb": (0.0, 0), "havaa": (0.0, 0),
+        })
+        total = len(gdf)
+        in_zone = int(gdf["in_zone"].sum())
+        e["count"] += total
+        e["in_zone"] += in_zone
+        e["out_zone"] += total - in_zone
+        e["whiffs"] += int(gdf["is_whiff"].sum())
+        e["called_strikes"] += int(gdf["is_called_strike"].sum())
+        e["strikes"] += int(gdf["is_strike"].sum())
+        if total - in_zone > 0:
+            e["o_swings"] += int(gdf.loc[~gdf["in_zone"], "is_swing"].sum())
+        if "pitcher_team" in gdf.columns:
+            e["teams"].update(gdf["pitcher_team"].dropna().unique())
+
+        if has_strikes:
+            two_str_mask = gdf["strikes"] >= 2
+            n_two_str = int(two_str_mask.sum())
+            e["two_str_pitches"] += n_two_str
+            if has_events and n_two_str:
+                e["two_str_ks"] += int(
+                    gdf.loc[two_str_mask, "events"].dropna().astype(str).str.lower().isin(_K_EVENTS).sum()
+                )
+        if has_stand:
+            e["vs_r"] += int((gdf["stand"] == "R").sum())
+            e["vs_l"] += int((gdf["stand"] == "L").sum())
+
+        _add_pair(e, "velo", _sum_pair(gdf["release_speed"]))
+        _add_pair(e, "ext", _sum_pair(gdf["release_extension"]))
+        _add_pair(e, "ivb", _sum_pair(gdf["pfx_z"]))
+        _add_pair(e, "ihb", _sum_pair(gdf["pfx_x"]))
+        if "havaa" in gdf.columns:
+            _add_pair(e, "havaa", _sum_pair(gdf["havaa"]))
+
+
+def finalize_pitch_data(acc):
+    """Turn a merged accumulator into the same rows aggregate_pitch_data_range returns."""
+    results = []
+    for (pitcher_id, name, hand, pitch_name, pitch_type), e in acc["groups"].items():
+        total = e["count"]
+        pitcher_total = acc["pitcher_totals"].get(pitcher_id, 0)
+        vs_r_total = acc["vs_r"].get(pitcher_id, 0)
+        vs_l_total = acc["vs_l"].get(pitcher_id, 0)
+        teams = sorted(e["teams"])
+        results.append({
+            "pitcher_id": int(pitcher_id),
+            "pitcher": name,
+            "team": teams[0] if len(teams) == 1 else "/".join(teams),
+            "hand": hand,
+            "pitch_type": pitch_type,
+            "pitch_name": pitch_name,
+            "count": total,
+            "velo": _mean_or_none(e["velo"]),
+            "usage": round(total / pitcher_total * 100, 1) if pitcher_total else 0,
+            "usage_vs_r": round(e["vs_r"] / vs_r_total * 100, 1) if vs_r_total else 0,
+            "usage_vs_l": round(e["vs_l"] / vs_l_total * 100, 1) if vs_l_total else 0,
+            "count_vs_r": e["vs_r"], "count_vs_l": e["vs_l"],
+            "ext": _mean_or_none(e["ext"]),
+            "ivb": _mean_or_none(e["ivb"], scale=12),
+            "ihb": _mean_or_none(e["ihb"], scale=12),
+            "havaa": _mean_or_none(e["havaa"]),
+            "whiffs": e["whiffs"],
+            "zone_pct": round(e["in_zone"] / total * 100, 1) if total else 0,
+            "o_swing_pct": round(e["o_swings"] / e["out_zone"] * 100, 1) if e["out_zone"] else 0,
+            # Unrounded, same as aggregate_pitch_data_range — frontend rounds once.
+            "strike_pct": (e["strikes"] / total * 100) if total else 0,
+            "cs_pct": (e["called_strikes"] / total * 100) if total else 0,
+            "swstr_pct": (e["whiffs"] / total * 100) if total else 0,
+            "csw_pct": ((e["called_strikes"] + e["whiffs"]) / total * 100) if total else 0,
+            "two_str_pitches": e["two_str_pitches"],
+            "two_str_ks": e["two_str_ks"],
+        })
+    results.sort(key=lambda r: (r["pitcher"], r["pitch_name"]))
+    return results
+
+
 def get_pitcher_game_log(df, pitcher_id):
     """Get per-game stats for a single pitcher from a date-range DataFrame."""
     if df.empty:

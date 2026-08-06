@@ -1742,6 +1742,82 @@ def _load_persisted_range(start_date, end_date):
     return pd.concat(frames, ignore_index=True)
 
 
+def _merge_daily_cache_for_day(day_df, date_str):
+    """Per-day equivalent of _merge_daily_cache.
+
+    Safe to do a day at a time because a game_pk belongs to exactly one
+    game_date, so "which cached game_pks are absent from the range data" is a
+    question that never spans days.
+    """
+    cached = _cache.get(date_str)
+    cached_df = cached[1] if isinstance(cached, tuple) else cached
+    if cached_df is None or cached_df.empty:
+        return day_df
+    if day_df is None or day_df.empty:
+        return cached_df
+    if "game_pk" not in day_df.columns or "game_pk" not in cached_df.columns:
+        return day_df
+    missing_pks = set(cached_df["game_pk"].unique()) - set(day_df["game_pk"].unique())
+    if not missing_pks:
+        return day_df
+    extra = cached_df[cached_df["game_pk"].isin(missing_pks)]
+    return pd.concat([day_df, extra], ignore_index=True)
+
+
+# How many days to keep in flight. The Redis round-trips are the slow part, so
+# reading strictly one day at a time would give back the ~5-8x the old parallel
+# load bought. A bounded lookahead keeps most of that speedup while capping
+# resident memory at (lookahead x one day) instead of the whole season.
+RANGE_STREAM_LOOKAHEAD = 8
+
+
+def fold_range_materialized(start_date, end_date, fold):
+    """Stream a materialized range through `fold`, one day at a time.
+
+    The memory-safe counterpart to fetch_date_range_materialized: same day set,
+    same daily-cache merge, but it never builds a season-wide frame. A season is
+    ~612k pitch rows — on the order of 1.3 GB as one frame, with a transient 2x
+    during the concat, against a 3009 MB function limit.
+
+    `fold(day_df)` is called once per day that has rows, in date order. Returns
+    True when the range was complete, False when a day is not yet materialized
+    (the caller should answer 202).
+    """
+    persisted_end = _previous_date(end_date) if _is_today(end_date) else end_date
+
+    if persisted_end >= start_date:
+        # Same cheap pre-check as _load_persisted_range: one SMEMBERS, and a
+        # single confirming GET because the marker set can under-report.
+        probably_missing = missing_range_days(start_date, persisted_end)
+        if probably_missing and _load_range_day(probably_missing[0]) is None:
+            return False
+
+        date_list = list(_date_strings(start_date, persisted_end))
+        pool = ThreadPoolExecutor(max_workers=RANGE_STREAM_LOOKAHEAD)
+        try:
+            pending = {}
+            for idx, date_str in enumerate(date_list):
+                # Top the queue up to the lookahead, then consume in date order.
+                while len(pending) < RANGE_STREAM_LOOKAHEAD and (idx + len(pending)) < len(date_list):
+                    ahead = date_list[idx + len(pending)]
+                    pending[ahead] = pool.submit(_load_range_day, ahead)
+                day = pending.pop(date_str).result()
+                if day is None:
+                    return False  # not materialized — caller 202s
+                day = _merge_daily_cache_for_day(day, date_str)
+                if day is not None and not day.empty:
+                    fold(day)
+                del day
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    if _is_today(end_date):
+        today_df = fetch_date(end_date)
+        if today_df is not None and not today_df.empty:
+            fold(today_df)
+    return True
+
+
 def _merge_daily_cache(df, start_date, end_date):
     """Merge any cached daily data into a range DataFrame.
 

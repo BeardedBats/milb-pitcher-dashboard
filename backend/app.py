@@ -25,7 +25,8 @@ from data import (
     get_games, clear_cache, clear_live_refresh_cache, get_default_date, get_game_linescore,
     save_pitch_override, remove_pitch_override, get_all_overrides,
     fetch_date_range, prefetch_boxscores,
-    fetch_date_range_materialized, fetch_all_pitchers_list_materialized,
+    fetch_date_range_materialized, fold_range_materialized,
+    fetch_all_pitchers_list_materialized,
     fetch_pitchers_directory,
     queue_range_materialization, get_range_materialization_status,
     drain_pending_materializations,
@@ -44,6 +45,8 @@ from aggregation import (
     get_season_averages, aggregate_pitcher_results_range,
     aggregate_pitch_data_range, get_pitcher_game_log,
     find_previous_mlb_season,
+    new_results_accumulator, accumulate_pitcher_results, finalize_pitcher_results,
+    new_pitch_data_accumulator, accumulate_pitch_data, finalize_pitch_data,
 )
 from levels import (
     DEFAULT_LEVEL, LEVELS, LEVEL_ORDER, STATCAST_LEVELS, normalize_level,
@@ -1356,19 +1359,30 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
     cached = get_agg_cache(agg_key)
     if cached is not None:
         return cached
-    df = fetch_date_range_materialized(start_date, end_date)
-    if df is None:
+    # Streamed a day at a time rather than materializing the whole season into
+    # one frame first — see fold_range_materialized. Only this team's rows are
+    # ever accumulated, so peak memory is one day, not ~612k pitch rows.
+    pitch_view = view == "pitch-data"
+    acc = new_pitch_data_accumulator() if pitch_view else new_results_accumulator()
+
+    def fold(day_df):
+        if "pitcher_team" in day_df.columns:
+            day_df = day_df[day_df["pitcher_team"] == team]
+        if day_df.empty:
+            return
+        if pitch_view:
+            accumulate_pitch_data(acc, day_df)
+        else:
+            accumulate_pitcher_results(acc, day_df)
+
+    if not fold_range_materialized(start_date, end_date, fold):
         return _loading_response(response, start_date, end_date)
-    if df.empty:
+
+    result = tag_mlb_experience(
+        finalize_pitch_data(acc) if pitch_view else finalize_pitcher_results(acc)
+    )
+    if not result:
         return []
-    if "pitcher_team" in df.columns:
-        df = df[df["pitcher_team"] == team]
-    if df.empty:
-        return []
-    if view == "pitch-data":
-        result = tag_mlb_experience(aggregate_pitch_data_range(df))
-    else:
-        result = tag_mlb_experience(aggregate_pitcher_results_range(df))
     set_agg_cache(agg_key, result)
     return result
 
@@ -1520,21 +1534,35 @@ def org_page(
 
     # Optional AAA upgrade: richer per-pitch columns (CSW%, whiffs) when the
     # season range is materialized. Never blocks the response.
-    try:
-        df = fetch_date_range_materialized(start_date, end_date)
-    except Exception as e:
-        print(f"[OrgPage] materialized range lookup failed: {e}")
-        df = None
-    if df is not None and not df.empty and "pitcher_team" in df.columns:
-        for block in blocks:
-            if block["level"] != "AAA":
-                continue
-            tdf = df[df["pitcher_team"] == block["team"]]
-            if "level" in tdf.columns:
-                tdf = tdf[tdf["level"] == "AAA"]
-            if not tdf.empty:
-                block["rows"] = tag_mlb_experience(aggregate_pitcher_results_range(tdf))
-                block["statcast"] = True
+    #
+    # Streamed per day (see fold_range_materialized) with one accumulator per
+    # AAA affiliate, so the whole season is never resident. Previously this
+    # built the entire league-wide season frame just to slice a few teams out
+    # of it — on a page that treats the result as optional.
+    aaa_blocks = [b for b in blocks if b["level"] == "AAA"]
+    if aaa_blocks:
+        accs = {b["team"]: new_results_accumulator() for b in aaa_blocks}
+
+        def fold(day_df):
+            if "level" in day_df.columns:
+                day_df = day_df[day_df["level"] == "AAA"]
+            if day_df.empty or "pitcher_team" not in day_df.columns:
+                return
+            for team_abbrev, tdf in day_df.groupby("pitcher_team"):
+                if team_abbrev in accs and not tdf.empty:
+                    accumulate_pitcher_results(accs[team_abbrev], tdf)
+
+        try:
+            complete = fold_range_materialized(start_date, end_date, fold)
+        except Exception as e:
+            print(f"[OrgPage] materialized range lookup failed: {e}")
+            complete = False
+        if complete:
+            for block in aaa_blocks:
+                rows = finalize_pitcher_results(accs[block["team"]])
+                if rows:
+                    block["rows"] = tag_mlb_experience(rows)
+                    block["statcast"] = True
 
     payload = {"org": org, "affiliates": blocks}
     if any(b["rows"] for b in blocks):

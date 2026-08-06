@@ -3,6 +3,7 @@ import { PITCH_COLORS } from "../constants";
 import { fetchOrgPage, fetchWarmupStatus } from "../utils/api";
 import { buildPlayerHash } from "../utils/navigation";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
+import WarmupStalled from "./WarmupStalled";
 
 // Team pages route per MLB ORG (LAD, DET, ...), not per affiliate: one table
 // per affiliate stacked highest level first (AAA → AA → A+ → A → R), formatted
@@ -131,7 +132,7 @@ function AffiliateTable({ block, onPlayerClick }) {
 export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
   const org = (teamAbbrev || "").toUpperCase();
 
-  const { data, loading, message: loadMsg } = useWarmupBackedResource({
+  const { data, loading, message: loadMsg, stalled, reload } = useWarmupBackedResource({
     key: [org],
     load: () => fetchOrgPage(org),
     pollWarmup: fetchWarmupStatus,
@@ -148,7 +149,9 @@ export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
         <a className="back-btn" href={window.location.pathname} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); onBack(); } }} style={{ textDecoration: "none" }}>← Back</a>
         <h2 className="page-title">{org} System</h2>
       </div>
-      {loading ? (
+      {stalled ? (
+        <WarmupStalled message={loadMsg} onRetry={reload} />
+      ) : loading ? (
         <div className="loading-msg"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div>{loadMsg}</div>
       ) : affiliates.length === 0 ? (
         <div className="no-data">No affiliates found for {org}.</div>

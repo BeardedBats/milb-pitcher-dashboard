@@ -129,22 +129,34 @@ def _json_response(payload, status_code=200, scope="live"):
     return resp
 
 
+# How long a client should wait before asking again. Materialization only
+# advances when /api/cron/materialize-ranges runs, and that cron is on a
+# 5-minute schedule — polling faster than this cannot observe new progress, it
+# just bills another invocation. The client treats this as a floor and still
+# applies its own backoff on top (see utils/pollBackoff.js), so this can only
+# slow clients down, never speed them up.
+LOADING_RETRY_AFTER_SECONDS = 15
+
+
 def _loading_response(response: Response, start_date: str, end_date: str):
     _set_response_cache(response, "mutation")
     job = queue_range_materialization(start_date, end_date)
     status = job.get("status", "pending")
-    return _json_response(
+    resp = _json_response(
         {
             "status": status,
             "message": "Season cache is rebuilding",
             "start_date": start_date,
             "end_date": end_date,
             "materialization_started": bool(job.get("queued")),
+            "retry_after": LOADING_RETRY_AFTER_SECONDS,
             **({"error": job.get("error")} if job.get("error") else {}),
         },
         status_code=202,
         scope="mutation",
     )
+    resp.headers["Retry-After"] = str(LOADING_RETRY_AFTER_SECONDS)
+    return resp
 
 
 def _valid_date_param(value: str) -> bool:

@@ -67,8 +67,17 @@ Apply only to the `Pitch Mix` view with no pitch-type filter. Controls render in
 - Helpers in `frontend/src/utils/gameLogPitch.js`: `pitchMixHeatRanges`, `pitchMixHeatStyle`, `buildMixBarSegments`, `hexToRgba`.
 - Detector + config in `frontend/src/utils/approachShift.js`: `detectApproachShift(games, pitchKeys)`; constants `MIN_SIDE_PITCHES=15`, `MIN_PHASE_GAMES=3`, `MIN_TVD=8`. Significance = seeded permutation test (p<0.05, deterministic — no flicker) AND TVD ≥ `MIN_TVD`; returns null ("no shift") otherwise.
 
+### 202 "cache is rebuilding" — the polling contract
+Season-materialized endpoints answer **202** with a JSON status body while the range bakes. A 202 is a SUCCESS the client must pace itself against, not an error — and an endpoint can 202 for hours, because materialization only advances when the 5-minute `materialize-ranges` cron runs. An unpaced retry loop therefore turns every open tab into a request generator: measured at **473 requests in 45 minutes** while `/api/org-page` was permanently 202.
+- `frontend/src/hooks/useWarmupBackedResource.js` owns the loop (used by `TeamPage` and `PlayerPage`). It is bounded on three independent axes and **all three must stay**: exponential backoff (2s→30s cap, jittered), a total wait budget (`DEFAULT_RETRY_BUDGET_MS`, 5 min) after which it reports `stalled` and hands over to a manual Retry, and visibility gating (a hidden tab holds its attempt; hidden time does not count against the budget).
+- Schedule lives in `frontend/src/utils/pollBackoff.js` — pure and unit-tested. `nextRetryDelay` takes `max(backoff, serverHint)`, so a server hint can only SLOW a client, never release the throttle.
+- `_loading_response` in `backend/app.py` publishes `retry_after` (and the `Retry-After` header) from `LOADING_RETRY_AFTER_SECONDS`. Keep it ≥ the client's opening backoff or it is a no-op.
+- Give-up UI is `frontend/src/components/WarmupStalled.jsx`. Consumers must branch `stalled` BEFORE `loading` — `stalled` sets `loading` false, so an unguarded page falls through to its empty state ("No affiliates found") instead of the Retry panel.
+- Warmup progress (`pollWarmup`) is fetched once per retry. Do NOT restore an independent timer for it; that was a second unbounded request source.
+
 ### Frontend Utilities
 - `frontend/src/utils/pitchFilters.js` — `getTooltipResult(pitch, opts)` shared tooltip utility returning `{ label, color, isK, isCalledStrikeThree, subLabel }`. Normalizes both Statcast and PBP formats.
+- `frontend/src/utils/pollBackoff.js` — `nextRetryDelay`, `parseRetryAfter`, `jitter` + the retry constants. See the 202 contract above.
 - `frontend/src/utils/api.js` — All fetch functions including `fetchPitcherSeasonTotals`.
 - `frontend/src/utils/formatting.js` — Cell highlight, emphasis frames, formatting helpers.
 - `frontend/src/constants.js` — `PITCH_COLORS`, `CARD_PITCH_DATA_COLUMNS`, `CARD_RESULTS_COLUMNS`, `TEAM_FULL_NAMES`, `displayAbbrev`.

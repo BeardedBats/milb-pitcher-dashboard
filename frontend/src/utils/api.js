@@ -108,11 +108,14 @@ export async function fetchPitcherCard(date, pitcherId, gamePk) {
   });
 }
 
+// Season totals. `/api/pitcher-season-totals` is season-materialized, so it can
+// answer 202 with a warmup status body instead of totals — and `res.ok` is TRUE
+// for a 202, so the old `if (!res.ok) throw` guard let that status body through
+// as if it were data. Status-backed like its siblings below: callers branch on
+// `status`, or hand this straight to useWarmupBackedResource.
 export async function fetchPitcherSeasonTotals(pitcherId, startDate = "2026-03-25", endDate = "") {
-  const url = `${BASE}/api/pitcher-season-totals?pitcher_id=${pitcherId}&start_date=${startDate}&end_date=${endDate}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("Failed to fetch season totals");
-  return res.json();
+  const params = new URLSearchParams({ pitcher_id: pitcherId, start_date: startDate, end_date: endDate });
+  return fetchStatusBacked(`${BASE}/api/pitcher-season-totals?${params}`);
 }
 
 export async function fetchPlayerPage(pitcherId, startDate = "2026-03-25") {

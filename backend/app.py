@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests as http_requests
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +54,10 @@ from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers,
     enrich_log_with_pitch_metrics, get_game_pitch_metrics,
-    _METRICS_VERSION,
+    _METRICS_VERSION, _gamelog_for_level,
+)
+from mlb_status import (
+    get_mlb_experience, tag_mlb_experience, get_il_pitchers, get_starters_in_range,
 )
 from redis_cache import redis_get, redis_set, redis_delete
 
@@ -225,12 +228,12 @@ def pitch_data(
         agg_key = f"daily_pitch_{level}_{date}"
         cached = get_agg_cache(agg_key)
         if cached is not None:
-            return cached
-        result = aggregate_pitch_data(date, game_pk, level=level)
+            return tag_mlb_experience(cached)
+        result = tag_mlb_experience(aggregate_pitch_data(date, game_pk, level=level))
         set_agg_cache(agg_key, result)
         record_stat_lines_refresh(date)
         return result
-    return aggregate_pitch_data(date, game_pk, level=level)
+    return tag_mlb_experience(aggregate_pitch_data(date, game_pk, level=level))
 
 @app.get("/api/pitcher-results")
 def pitcher_results(
@@ -248,9 +251,9 @@ def pitcher_results(
         agg_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
         cached = get_agg_cache(agg_key)
         if cached is not None:
-            rows = cached
+            rows = tag_mlb_experience(cached)
         else:
-            rows = get_level_results(date, level)
+            rows = tag_mlb_experience(get_level_results(date, level))
             if rows:
                 set_agg_cache(agg_key, rows)
         if game_pk is not None:
@@ -261,11 +264,11 @@ def pitcher_results(
         agg_key = f"daily_results_{level}_s{CARD_SCHEMA_VERSION}_{date}"
         cached = get_agg_cache(agg_key)
         if cached is not None:
-            return cached
+            return tag_mlb_experience(cached)
         # include_season_context drives the velo/ext deltas + opener-swap
         # detection. Both internal helpers now use fetch_date_range_materialized
         # so this is safe to keep on (no Savant CSV roundtrips).
-        result = aggregate_pitcher_results(date, game_pk, include_season_context=True, level=level)
+        result = tag_mlb_experience(aggregate_pitcher_results(date, game_pk, include_season_context=True, level=level))
         # Don't cache a degraded payload — if the materialized range was missing
         # when this aggregation ran, every row's velo_season / *_delta is null.
         # Caching that would lock out deltas until the next schema bump. Only
@@ -280,7 +283,7 @@ def pitcher_results(
             set_agg_cache(agg_key, result)
             record_stat_lines_refresh(date)
         return result
-    return aggregate_pitcher_results(date, game_pk, level=level)
+    return tag_mlb_experience(aggregate_pitcher_results(date, game_pk, level=level))
 
 
 @app.get("/api/game-view")
@@ -326,7 +329,7 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
         box_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
         rows = get_agg_cache(box_key)
         if rows is None:
-            rows = get_level_results(date, level, games=games_list)
+            rows = tag_mlb_experience(get_level_results(date, level, games=games_list))
             if rows:
                 set_agg_cache(box_key, rows)
         return {
@@ -344,7 +347,9 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
     cached_results = get_agg_cache(results_key)
 
     section = time.perf_counter()
-    pd_data = cached_pitch if cached_pitch is not None else aggregate_pitch_data(date, None, level=level)
+    # tag_mlb_experience runs on the cached branch too: the cache may predate
+    # the flag, and the lookup is a no-op when every id is already known.
+    pd_data = tag_mlb_experience(cached_pitch if cached_pitch is not None else aggregate_pitch_data(date, None, level=level))
     timings["pitch_data"] = round((time.perf_counter() - section) * 1000, 1)
     timings["pitch_data_cached"] = cached_pitch is not None
 
@@ -352,7 +357,7 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
     # include_season_context=True so velo/ext deltas land on the homepage
     # table. The helpers are materialized-range-only so they don't trigger a
     # synchronous Savant range pull on the first paint.
-    pr_data = cached_results if cached_results is not None else aggregate_pitcher_results(date, None, include_season_context=True, level=level)
+    pr_data = tag_mlb_experience(cached_results if cached_results is not None else aggregate_pitcher_results(date, None, include_season_context=True, level=level))
     timings["pitcher_results"] = round((time.perf_counter() - section) * 1000, 1)
     timings["pitcher_results_cached"] = cached_results is not None
 
@@ -1349,11 +1354,104 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
     if df.empty:
         return []
     if view == "pitch-data":
-        result = aggregate_pitch_data_range(df)
+        result = tag_mlb_experience(aggregate_pitch_data_range(df))
     else:
-        result = aggregate_pitcher_results_range(df)
+        result = tag_mlb_experience(aggregate_pitcher_results_range(df))
     set_agg_cache(agg_key, result)
     return result
+
+@app.get("/api/rehab-starts")
+def rehab_starts(response: Response, days: int = Query(14)):
+    """MLB pitchers on an injured list who have made a minor-league START recently.
+
+    The obvious implementation — walk every IL pitcher's game log — is ~6 calls
+    per player across levels. This funnels instead, cheapest filter first:
+
+      1. MLB rosters (30 calls, hourly cache) -> pitchers with an IL/RA status
+      2. one byDateRange call PER LEVEL (6) -> everyone with a start in the window
+      3. intersect: an IL pitcher who started in the minors is a rehab start
+      4. require MLB experience, so an injured PROSPECT on the org's full roster
+         isn't mistaken for a rehabbing big leaguer
+      5. only now, for that handful, pull game logs for the exact start dates
+
+    Steps 1-2 are shared and cached, so the per-player cost lands on a list that
+    is typically a few dozen long rather than several hundred.
+    """
+    _set_response_cache(response, "live")
+    days = max(1, min(int(days or 14), 45))
+    today = _now_et().date()
+    start_date = (today - timedelta(days=days)).isoformat()
+    end_date = today.isoformat()
+    season = today.year
+
+    cache_key = f"rehab_starts_{days}_{end_date}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}"
+    cached = get_agg_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    il = get_il_pitchers(season)
+    if not il:
+        return {"start_date": start_date, "end_date": end_date, "pitchers": []}
+
+    # Which levels did each IL pitcher start at during the window?
+    started_at = {}   # {pitcher_id: [level, ...]}
+    for code in LEVEL_ORDER:
+        sport_id = LEVELS[code]["sport_id"]
+        for pid in get_starters_in_range(sport_id, start_date, end_date):
+            if pid in il:
+                started_at.setdefault(pid, []).append(code)
+    if not started_at:
+        payload = {"start_date": start_date, "end_date": end_date, "pitchers": []}
+        set_agg_cache(cache_key, payload)
+        return payload
+
+    # An injured prospect is on the org's full roster too — only a pitcher who
+    # has actually debuted in the majors is on a rehab assignment.
+    exp = get_mlb_experience(list(started_at.keys()))
+    candidates = {pid: lv for pid, lv in started_at.items() if exp.get(pid)}
+
+    rows = []
+
+    def _starts_for(pid, levels):
+        found = []
+        for code in levels:
+            for g in (_gamelog_for_level(pid, season, code) or []):
+                if g.get("date", "") < start_date or not g.get("games_started"):
+                    continue
+                found.append(g)
+        return found
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_starts_for, pid, lv): pid for pid, lv in candidates.items()}
+        for f in as_completed(futures):
+            pid = futures[f]
+            try:
+                starts = f.result() or []
+            except Exception as e:
+                print(f"[RehabStarts] game log failed for {pid}: {e}")
+                continue
+            if not starts:
+                continue
+            starts.sort(key=lambda g: g.get("date") or "")
+            latest = starts[-1]
+            info = il.get(pid) or {}
+            rows.append({
+                **latest,
+                "pitcher_id": pid,
+                "pitcher": info.get("name") or (get_person_info(pid) or {}).get("name", ""),
+                "il_status": info.get("status"),
+                "il_status_code": info.get("status_code"),
+                "rehab_starts": len(starts),
+                "start_dates": [g.get("date") for g in starts],
+                "mlb_exp": True,
+            })
+
+    # Most recent rehab start first — that is the question this view answers.
+    rows.sort(key=lambda r: (r.get("date") or "", r.get("pitcher") or ""), reverse=True)
+    payload = {"start_date": start_date, "end_date": end_date, "pitchers": rows}
+    set_agg_cache(cache_key, payload)
+    return payload
+
 
 @app.get("/api/org-page")
 def org_page(
@@ -1400,11 +1498,11 @@ def org_page(
             if "level" in tdf.columns:
                 tdf = tdf[tdf["level"] == "AAA"]
             if not tdf.empty:
-                rows = aggregate_pitcher_results_range(tdf)
+                rows = tag_mlb_experience(aggregate_pitcher_results_range(tdf))
         else:
             # Non-Statcast affiliate: one season-stats call per team beats
             # walking its whole schedule for box scores.
-            rows = get_team_season_pitchers(meta["team_id"], code, season_year)
+            rows = tag_mlb_experience(get_team_season_pitchers(meta["team_id"], code, season_year))
         blocks.append({
             "level": code,
             "team_id": meta["team_id"],

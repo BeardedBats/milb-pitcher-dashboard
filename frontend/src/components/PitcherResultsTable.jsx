@@ -277,7 +277,13 @@ export default function PitcherResultsTable({ data, date, onPitcherClick, spOnly
     if (col.key === "pitcher") {
       if (!v) return <span className="pitcher-name" style={{ color: "rgb(180, 185, 219)" }}>--</span>;
       const isSP = row.role === "SP";
-      const nameClass = isSP ? "pitcher-name pitcher-sp-highlight" : "pitcher-name";
+      // Pitchers with big-league service are tinted Changeup green so a
+      // rehabbing or optioned MLB arm stands out from career minor leaguers.
+      const nameClass = [
+        "pitcher-name",
+        isSP ? "pitcher-sp-highlight" : "",
+        row.mlb_exp ? "mlb-exp" : "",
+      ].filter(Boolean).join(" ");
       if (onPitcherClick && row.pitcher_id && row.game_pk && date) {
         const cardHref = `#card/${date}/${row.pitcher_id}/${row.game_pk}`;
         return <a className={nameClass} href={cardHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} onAuxClick={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ textDecoration: "none" }}>{v}</a>;

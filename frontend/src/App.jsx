@@ -9,7 +9,8 @@ import PlayByPlayModal from "./components/PlayByPlayModal";
 import ReclassifyModal from "./components/ReclassifyModal";
 import SearchBar from "./components/SearchBar";
 import AdaptedResultsTable, { ADAPTED_COLUMNS, ADAPTED_DEFAULT_HIDDEN } from "./components/AdaptedResultsTable";
-import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, DEFAULT_LEVEL } from "./utils/api";
+import RehabStartsTable from "./components/RehabStartsTable";
+import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, fetchRehabStarts, DEFAULT_LEVEL } from "./utils/api";
 import { PITCH_TYPE_FILTERS, PITCH_COLORS, TEAM_FULL_NAMES, PITCHER_RESULTS_COLUMNS } from "./constants";
 import usePersistentState from "./hooks/usePersistentState";
 import { usePolledLinescore } from "./hooks/useLiveLinescore";
@@ -91,6 +92,13 @@ export default function App() {
   const [level, setLevel] = usePersistentState("pl_milb_level", DEFAULT_LEVEL);
   const [orgFilter, setOrgFilter] = usePersistentState("pl_milb_org", "");
   const [levelMeta, setLevelMeta] = useState(null);
+  // Rehab SP is a cross-level view (MLB arms on the IL rehabbing anywhere in
+  // the minors), so it ignores the level/org filters entirely.
+  const [rehabMode, setRehabMode] = useState(false);
+  const [rehabData, setRehabData] = useState(null);
+  const [rehabLoading, setRehabLoading] = useState(false);
+  const [rehabSortKey, setRehabSortKey] = useState("date");
+  const [rehabSortDir, setRehabSortDir] = useState("desc");
   const [pitchFilter, setPitchFilter] = useState("Four-Seamer");
   const [resultsHiddenCols, setResultsHiddenCols] = useState(["team", "hand"]);
   // The adapted table has far more columns than the Statcast one (five metric
@@ -167,6 +175,23 @@ export default function App() {
           .catch(() => setDate(getYesterdayEST()));
       });
   }, []); // eslint-disable-line
+
+  // Rehab SP data — fetched on first activation, then reused.
+  //
+  // In-flight state lives in a ref, NOT the dep array: setRehabLoading(true)
+  // would re-run the effect, whose cleanup would flip `cancelled` and throw
+  // away the response that was already on its way, leaving the view stuck on
+  // "Finding rehab starts...".
+  const rehabInFlight = React.useRef(false);
+  useEffect(() => {
+    if (!rehabMode || rehabData || rehabInFlight.current) return;
+    rehabInFlight.current = true;
+    setRehabLoading(true);
+    fetchRehabStarts(14)
+      .then(d => { setRehabData(d); })
+      .catch(() => { setRehabData({ pitchers: [] }); })
+      .finally(() => { rehabInFlight.current = false; setRehabLoading(false); });
+  }, [rehabMode, rehabData]);
 
   // Level + org dropdown options (static per season).
   useEffect(() => {
@@ -900,6 +925,15 @@ export default function App() {
                     <input type="checkbox" checked={splitByTeam} onChange={e => setSplitByTeam(e.target.checked)} />
                     <span>By Team</span>
                   </label>
+                  {/* Cross-level view: MLB arms on an IL rehabbing anywhere in
+                      the system. Ignores the level and org filters. */}
+                  <button
+                    className={`view-btn${rehabMode ? " active" : ""}`}
+                    onClick={() => setRehabMode(v => !v)}
+                    title="MLB pitchers on the IL who have made a minor-league start in the last two weeks"
+                  >
+                    Rehab SP
+                  </button>
                   {view === "pitcher-results" && (
                     <div className="col-filter-inline">
                       <button className="col-filter-toggle" onClick={() => setShowColFilter(v => !v)}>
@@ -981,14 +1015,28 @@ export default function App() {
         <div className="main-table-area">
           <div className={splitByTeam ? "table-card-none" : "table-card"}>
             <div className="table-container">
-              {view === "pitch-data" && isStatcastLevel && (
+              {/* Rehab SP replaces the slate tables entirely — it is not a
+                  filter on the current date/level, it is its own question. */}
+              {rehabMode && (
+                rehabLoading
+                  ? <div className="loading-msg"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div>Finding rehab starts across all levels...</div>
+                  : <RehabStartsTable
+                      data={rehabData}
+                      onPitcherClick={(id, e) => navigateToPlayer(id, null, e)}
+                      sortKey={rehabSortKey}
+                      onSortKeyChange={setRehabSortKey}
+                      sortDir={rehabSortDir}
+                      onSortDirChange={setRehabSortDir}
+                    />
+              )}
+              {!rehabMode && view === "pitch-data" && isStatcastLevel && (
                 <PitchDataTable data={filteredPitchData} date={date} onPitcherClick={openCard} splitByTeam={splitByTeam} spOnly={spOnly} isMobile={isMobile} sortKey={pitchSortKey} onSortKeyChange={setPitchSortKey} sortDir={pitchSortDir} onSortDirChange={setPitchSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
-              {view === "pitcher-results" && isStatcastLevel && (
+              {!rehabMode && view === "pitcher-results" && isStatcastLevel && (
                 <PitcherResultsTable data={filteredResultsData} date={date} onPitcherClick={openCard} spOnly={spOnly} splitByTeam={splitByTeam} isMobile={isMobile} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} hiddenCols={resultsHiddenCols} onSortedRowsChange={setCurrentTableRows} />
               )}
               {/* Below AAA the box score is all there is — adapted columns only. */}
-              {!isStatcastLevel && (
+              {!rehabMode && !isStatcastLevel && (
                 <AdaptedResultsTable data={filteredResultsData} level={level} hiddenCols={adaptedHiddenCols} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
             </div>

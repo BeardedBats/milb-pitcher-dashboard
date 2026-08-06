@@ -109,7 +109,7 @@ function AffiliateTable({ block, onPlayerClick }) {
                   <tr key={`${row.pitcher_id}-${i}`}>
                     {cols.map(c => (
                       <td key={c.key}
-                        className={c.key === "pitcher" ? "pitcher-name-cell" : ""}
+                        className={[c.key === "pitcher" ? "pitcher-name-cell" : "", c.key === "pitcher" && row.mlb_exp ? "mlb-exp" : ""].filter(Boolean).join(" ")}
                         onClick={c.key === "pitcher" ? (e) => onPlayerClick(row.pitcher_id, row.pitcher, e) : undefined}
                         onMouseDown={c.key === "pitcher" ? (e) => { if (e.button === 1) { e.preventDefault(); onPlayerClick(row.pitcher_id, row.pitcher, e); } } : undefined}
                         style={c.key === "pitcher" ? { cursor: "pointer", color: "var(--name)" } : c.key === "pitch_name" ? { color: PITCH_COLORS[row.pitch_name] || "var(--text)" } : {}}

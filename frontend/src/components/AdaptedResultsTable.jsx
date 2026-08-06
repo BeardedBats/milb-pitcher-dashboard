@@ -194,14 +194,14 @@ export default function AdaptedResultsTable({
                   <td key={c.key}>
                     {onPitcherClick ? (
                       <span
-                        className="pitcher-link"
+                        className={row.mlb_exp ? "pitcher-link mlb-exp" : "pitcher-link"}
                         role="button"
                         tabIndex={0}
                         onClick={(e) => onPitcherClick(row.pitcher_id, e)}
                       >
                         {row.pitcher}
                       </span>
-                    ) : row.pitcher}
+                    ) : <span className={row.mlb_exp ? "mlb-exp" : undefined}>{row.pitcher}</span>}
                   </td>
                 );
               }

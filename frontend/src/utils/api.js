@@ -179,6 +179,15 @@ export async function fetchRefresh(date = "", gamePk = null) {
   return res.json();
 }
 
+// MLB pitchers on an IL who have made a minor-league start recently. Heavy on
+// a cold cache (MLB rosters + a per-level date-range sweep), so allow a long
+// timeout; the backend caches the assembled list.
+export async function fetchRehabStarts(days = 14) {
+  const res = await fetchWithTimeout(`${BASE}/api/rehab-starts?days=${days}`, { timeoutMs: 60000 });
+  if (!res.ok) throw new Error("Failed to fetch rehab starts");
+  return res.json();
+}
+
 export async function fetchLastRefresh(date = "") {
   const params = new URLSearchParams();
   if (date) params.set("date", date);

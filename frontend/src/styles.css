@@ -1792,3 +1792,24 @@ canvas { display: block; border: none; border-radius: var(--radius-sm); }
   border-top: 1px solid var(--border);
 }
 .col-filter-group:first-child { border-top: none; margin-top: 0; padding-top: 2px; }
+
+/* Pitchers with major-league service — Changeup green (PITCH_COLORS.Changeup).
+   !important because several pitcher-name cells carry an inline color
+   (TeamPage) or a competing highlight class (pitcher-sp-highlight), and the
+   MLB-experience tint should win in all of them. */
+.mlb-exp,
+.mlb-exp a,
+a.mlb-exp,
+td.mlb-exp,
+td.mlb-exp a { color: #6DE95D !important; }
+
+/* Rehab SP view */
+.rehab-date-cell { white-space: nowrap; }
+.rehab-il-tag {
+  display: inline-block; margin-left: 6px; padding: 1px 5px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.03em;
+  color: #FF839B; background: rgba(255, 131, 155, 0.12);
+  border: 1px solid rgba(255, 131, 155, 0.3); border-radius: 3px;
+  vertical-align: middle;
+}
+.rehab-empty { text-align: center; padding: 40px; color: var(--text-dim); }

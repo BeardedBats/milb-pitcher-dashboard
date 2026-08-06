@@ -226,9 +226,9 @@ export default function PitchDataTable({ data, date, onPitcherClick, columns, sp
       if (!v) return <span className="pitcher-name" style={{ color: "rgb(180, 185, 219)" }}>--</span>;
       if (onPitcherClick && row.pitcher_id && row.game_pk && date) {
         const cardHref = `#card/${date}/${row.pitcher_id}/${row.game_pk}`;
-        return <a className="pitcher-name" href={cardHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} onAuxClick={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ textDecoration: "none" }}>{v}</a>;
+        return <a className={row.mlb_exp ? "pitcher-name mlb-exp" : "pitcher-name"} href={cardHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} onAuxClick={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ textDecoration: "none" }}>{v}</a>;
       }
-      return <span className="pitcher-name">{v}</span>;
+      return <span className={row.mlb_exp ? "pitcher-name mlb-exp" : "pitcher-name"}>{v}</span>;
     }
     if (col.key === "team") return displayTeamAbbrev(v) || <span style={{ color: "rgb(180, 185, 219)" }}>--</span>;
     if (col.key === "hand") {

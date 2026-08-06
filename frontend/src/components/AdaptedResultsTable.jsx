@@ -1,55 +1,83 @@
 import React, { useMemo } from "react";
 
-// Box-score-only results table for levels without Statcast (AA, A+, A, R) and
-// for AFL games Savant never tracked. Every value comes straight off the box
-// score — the only derived figures are Str% (strikes/pitches) and GO/AO
-// (groundOuts/airOuts), both computed server-side in boxscore_levels.py.
+// Results table for the levels without Statcast (AA, A+, A, R) and for AFL
+// games Savant never tracked.
 //
-// Deliberately NOT a variant of PitcherResultsTable: that table is built around
-// Statcast columns (CSW%, whiffs, velo deltas) that simply do not exist below
-// AAA, and threading "hide half the columns" through it would make both harder
-// to read.
-// These levels have no Statcast — no velocity, pitch type or movement. But the
-// MLB live feed still records every pitch's CALL and every ball in play's
-// trajectory, so plate-discipline and batted-ball metrics ARE available and are
-// derived server-side in boxscore_levels._derive_pitch_metrics.
+// Those levels have no velocity, pitch type or movement — but the MLB live feed
+// still records every pitch's CALL, COUNT, batter HANDEDNESS and plate
+// LOCATION, and every ball in play's trajectory, hardness and fielder. So
+// plate-discipline, count, zone, batted-ball and contact-quality metrics are
+// all real here, derived server-side in boxscore_levels._derive_pitch_metrics.
 //
-// Batted-ball rates are over all balls in play; GO/AO is the box score's
-// outs-only ratio. Different denominators, both shown.
+// Deliberately NOT a variant of PitcherResultsTable: that one is built around
+// Statcast columns (velo deltas, movement) that genuinely don't exist below
+// AAA, and threading "hide half the columns" through it would hurt both.
+//
+// Note GB% and GO/AO have different denominators: GB% is over all balls in
+// play, GO/AO is the box score's outs-only ratio. Both are shown on purpose.
+
 export const ADAPTED_COLUMNS = [
-  { key: "date", label: "Date" },
-  { key: "pitcher", label: "Pitcher" },
-  { key: "team", label: "Team" },
-  { key: "opponent", label: "Opp" },
-  { key: "decision", label: "Dec" },
-  { key: "ip", label: "IP" },
-  { key: "hits", label: "H" },
-  { key: "runs", label: "R" },
-  { key: "er", label: "ER" },
-  { key: "bbs", label: "BB" },
-  { key: "ks", label: "K" },
-  { key: "hrs", label: "HR" },
-  { key: "batters_faced", label: "BF" },
-  { key: "pitches", label: "P" },
-  { key: "whiffs", label: "Whiffs", title: "Swinging strikes (incl. foul tips)" },
-  { key: "swstr_pct", label: "SwStr%", title: "Whiffs / pitches" },
-  { key: "csw_pct", label: "CSW%", title: "(Called strikes + whiffs) / pitches" },
-  { key: "strike_pct", label: "Str%" },
-  { key: "gb_pct", label: "GB%", title: "Ground balls / balls in play" },
-  { key: "fb_pct", label: "FB%", title: "Fly balls / balls in play" },
-  { key: "ld_pct", label: "LD%", title: "Line drives / balls in play" },
-  { key: "hard_pct", label: "Hard%", title: "Hard-hit / balls in play" },
-  { key: "go_ao", label: "GO/AO", title: "Ground outs / air outs (outs only)" },
+  { key: "date", label: "Date", group: "Box score" },
+  { key: "pitcher", label: "Pitcher", group: "Box score" },
+  { key: "team", label: "Team", group: "Box score" },
+  { key: "opponent", label: "Opp", group: "Box score" },
+  { key: "decision", label: "Dec", group: "Box score" },
+  { key: "ip", label: "IP", group: "Box score" },
+  { key: "hits", label: "H", group: "Box score" },
+  { key: "runs", label: "R", group: "Box score" },
+  { key: "er", label: "ER", group: "Box score" },
+  { key: "bbs", label: "BB", group: "Box score" },
+  { key: "ks", label: "K", group: "Box score" },
+  { key: "hrs", label: "HR", group: "Box score" },
+  { key: "batters_faced", label: "BF", group: "Box score" },
+  { key: "pitches", label: "P", group: "Box score" },
+
+  { key: "whiffs", label: "Whiffs", group: "Plate discipline", title: "Swinging strikes (incl. foul tips)" },
+  { key: "swstr_pct", label: "SwStr%", group: "Plate discipline", title: "Whiffs / pitches" },
+  { key: "csw_pct", label: "CSW%", group: "Plate discipline", title: "(Called strikes + whiffs) / pitches" },
+  { key: "strike_pct", label: "Str%", group: "Plate discipline" },
+  { key: "whiff_pct", label: "Whiff%", group: "Plate discipline", off: true, title: "Whiffs / swings" },
+  { key: "swing_pct", label: "Swing%", group: "Plate discipline", off: true, title: "Swings / pitches" },
+  { key: "contact_pct", label: "Contact%", group: "Plate discipline", off: true, title: "Contact / swings" },
+
+  { key: "f_strike_pct", label: "F-Str%", group: "Count", off: true, title: "First-pitch strikes / plate appearances" },
+  { key: "two_str_pct", label: "2Str%", group: "Count", off: true, title: "Pitches thrown in two-strike counts / pitches" },
+  { key: "par_pct", label: "PAR%", group: "Count", off: true, title: "Strikeouts / plate appearances that reached two strikes" },
+
+  { key: "zone_pct", label: "Zone%", group: "Zone", off: true, title: "In-zone pitches / pitches (location calibrated from Gameday coordinates)" },
+  { key: "o_swing_pct", label: "O-Swing%", group: "Zone", off: true, title: "Swings at out-of-zone pitches / out-of-zone pitches" },
+  { key: "z_swing_pct", label: "Z-Swing%", group: "Zone", off: true, title: "Swings at in-zone pitches / in-zone pitches" },
+  { key: "z_contact_pct", label: "Z-Con%", group: "Zone", off: true, title: "Contact on in-zone swings" },
+  { key: "o_contact_pct", label: "O-Con%", group: "Zone", off: true, title: "Contact on out-of-zone swings" },
+
+  { key: "gb_pct", label: "GB%", group: "Batted ball", title: "Ground balls / balls in play" },
+  { key: "fb_pct", label: "FB%", group: "Batted ball", title: "Fly balls / balls in play" },
+  { key: "ld_pct", label: "LD%", group: "Batted ball", title: "Line drives / balls in play" },
+  { key: "pu_pct", label: "PU%", group: "Batted ball", off: true, title: "Popups / balls in play" },
+  { key: "gb_fb_ratio", label: "GB/FB", group: "Batted ball", off: true },
+  { key: "go_ao", label: "GO/AO", group: "Batted ball", title: "Ground outs / air outs (outs only — a different denominator to GB%)" },
+
+  { key: "hard_pct", label: "Hard%", group: "Contact quality", title: "Hard-hit / balls in play" },
+  { key: "med_pct", label: "Med%", group: "Contact quality", off: true },
+  { key: "soft_pct", label: "Soft%", group: "Contact quality", off: true },
+  { key: "pull_pct", label: "Pull%", group: "Contact quality", off: true, title: "Pulled balls in play (fielder position, flipped for handedness)" },
+  { key: "center_pct", label: "Cent%", group: "Contact quality", off: true },
+  { key: "oppo_pct", label: "Oppo%", group: "Contact quality", off: true },
 ];
 
+export const ADAPTED_DEFAULT_HIDDEN = ADAPTED_COLUMNS.filter(c => c.off).map(c => c.key);
+
 const PCT_KEYS = new Set([
-  "strike_pct", "swstr_pct", "csw_pct", "gb_pct", "fb_pct", "ld_pct", "hard_pct",
+  "strike_pct", "swstr_pct", "csw_pct", "whiff_pct", "swing_pct", "contact_pct",
+  "f_strike_pct", "two_str_pct", "par_pct",
+  "zone_pct", "o_swing_pct", "z_swing_pct", "z_contact_pct", "o_contact_pct",
+  "gb_pct", "fb_pct", "ld_pct", "pu_pct",
+  "hard_pct", "med_pct", "soft_pct", "pull_pct", "center_pct", "oppo_pct",
 ]);
 
 const NUMERIC_KEYS = new Set([
   "hits", "runs", "er", "bbs", "ks", "hrs", "batters_faced", "pitches",
-  "whiffs", "strike_pct", "swstr_pct", "csw_pct",
-  "gb_pct", "fb_pct", "ld_pct", "hard_pct", "go_ao",
+  "whiffs", "go_ao", "gb_fb_ratio", ...PCT_KEYS,
 ]);
 
 function ipToNumeric(ip) {
@@ -77,7 +105,12 @@ export default function AdaptedResultsTable({
   sortDir,
   onSortDirChange,
   onSortedRowsChange,
+  hiddenCols = [],
 }) {
+  const cols = useMemo(
+    () => ADAPTED_COLUMNS.filter(c => !hiddenCols.includes(c.key)),
+    [hiddenCols],
+  );
   const handleSort = (key) => {
     if (sortKey === key) onSortDirChange(sortDir === "asc" ? "desc" : "asc");
     else { onSortKeyChange(key); onSortDirChange("desc"); }
@@ -130,7 +163,7 @@ export default function AdaptedResultsTable({
     <table className="data-table adapted-results-table">
       <thead>
         <tr>
-          {ADAPTED_COLUMNS.map(c => (
+          {cols.map(c => (
             <th
               key={c.key}
               onClick={() => handleSort(c.key)}
@@ -146,7 +179,7 @@ export default function AdaptedResultsTable({
       <tbody>
         {sorted.map(row => (
           <tr key={`${row.game_pk}-${row.pitcher_id}`}>
-            {ADAPTED_COLUMNS.map(c => {
+            {cols.map(c => {
               if (c.key === "date") {
                 // Date + level tag, per spec.
                 return (

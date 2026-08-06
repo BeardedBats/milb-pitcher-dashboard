@@ -1,0 +1,104 @@
+def _derive_pitch_metrics(feed):
+    """Per-pitcher pitch-level metrics from the play-by-play.
+
+    These levels have no Statcast — no velocity, no pitch type, no movement
+    (verified: startSpeed and details.type are absent on every pitch). But every
+    pitch still carries a CALL, and every ball in play carries a trajectory, so
+    the plate-discipline and batted-ball families are fully recoverable:
+
+        CSW%   = (called strikes + whiffs) / pitches
+        SwStr% = whiffs / pitches
+        GB/FB/LD/PU% = trajectory share of balls in play
+        Hard%  = hardness == "hard" share of balls in play
+
+    Attribution walks the events in order rather than trusting
+    `matchup.pitcher.id`, which names the pitcher who FINISHED the plate
+    appearance. On a mid-PA pitching change that misfiles every pitch the
+    departing pitcher threw in that PA — observed on 2026-07-30 in Rookie game
+    849353, where 3 pitches moved from De La Cruz to Martinez while the game
+    total still reconciled. `pitching_substitution` action events carry the
+    incoming `player.id`, so switching the active pitcher when one appears
+    attributes every pitch correctly.
+
+    Batted-ball rates here are over ALL balls in play, unlike the box score's
+    GO/AO which only counts balls in play that became OUTS. Both are exposed;
+    they are different denominators, not a discrepancy.
+    """
+    plays = (((feed or {}).get("liveData") or {}).get("plays") or {}).get("allPlays") or []
+    acc = {}
+
+    def _bucket(pid):
+        m = acc.get(pid)
+        if m is None:
+            m = acc[pid] = {
+                "tracked_pitches": 0, "whiffs": 0, "called_strikes": 0,
+                "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0, "hard": 0,
+            }
+        return m
+
+    active = None
+    for play in plays:
+        play_pitcher = ((play.get("matchup") or {}).get("pitcher") or {}).get("id")
+        events = sorted(play.get("playEvents") or [], key=lambda e: e.get("index", 0))
+        has_sub = any(
+            (e.get("details") or {}).get("eventType") == "pitching_substitution"
+            for e in events
+        )
+        # No substitution in this PA -> matchup.pitcher owns all of it and is
+        # the most reliable signal. Otherwise carry the previous PA's pitcher in
+        # and let the substitution events move it.
+        current = play_pitcher if not has_sub else (active if active is not None else play_pitcher)
+        for e in events:
+            if (e.get("details") or {}).get("eventType") == "pitching_substitution":
+                new_pid = (e.get("player") or {}).get("id")
+                if new_pid is not None:
+                    current = new_pid
+                continue
+            if current is None:
+                continue
+            if e.get("isPitch"):
+                m = _bucket(current)
+                m["tracked_pitches"] += 1
+                code = ((e.get("details") or {}).get("call") or {}).get("code")
+                if code in _WHIFF_CODES:
+                    m["whiffs"] += 1
+                elif code in _CALLED_CODES:
+                    m["called_strikes"] += 1
+            hd = e.get("hitData")
+            if hd:
+                m = _bucket(current)
+                m["bip"] += 1
+                traj = hd.get("trajectory")
+                if traj in _GB_TRAJ:
+                    m["gb"] += 1
+                elif traj in _FB_TRAJ:
+                    m["fb"] += 1
+                elif traj in _LD_TRAJ:
+                    m["ld"] += 1
+                elif traj in _PU_TRAJ:
+                    m["pu"] += 1
+                if hd.get("hardness") == "hard":
+                    m["hard"] += 1
+        if current is not None:
+            active = current
+
+    out = {}
+    for pid, m in acc.items():
+        p, bip = m["tracked_pitches"], m["bip"]
+        out[int(pid)] = {
+            "tracked_pitches": p,
+            "whiffs": m["whiffs"],
+            "called_strikes": m["called_strikes"],
+            "csw_pct": _pct(m["whiffs"] + m["called_strikes"], p),
+            "swstr_pct": _pct(m["whiffs"], p),
+            "bip": bip,
+            "gb": m["gb"], "fb": m["fb"], "ld": m["ld"], "pu": m["pu"],
+            "gb_pct": _pct(m["gb"], bip),
+            "fb_pct": _pct(m["fb"], bip),
+            "ld_pct": _pct(m["ld"], bip),
+            "pu_pct": _pct(m["pu"], bip),
+            "hard_pct": _pct(m["hard"], bip),
+        }
+    return out
+
+

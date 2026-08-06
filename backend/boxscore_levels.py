@@ -35,6 +35,49 @@ _FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 # data._reclassify_strikeout_fouls), so CSW/SwStr agree across the two paths.
 _WHIFF_CODES = frozenset({"S", "W", "T"})   # swinging, swinging-blocked, foul tip
 _CALLED_CODES = frozenset({"C"})            # called strike
+_FOUL_CODES = frozenset({"F", "L"})         # foul, foul bunt
+_INPLAY_CODES = frozenset({"X", "D", "E"})  # in play: out(s) / no out / run(s)
+_CONTACT_CODES = _FOUL_CODES | _INPLAY_CODES
+_SWING_CODES = _WHIFF_CODES | _CONTACT_CODES
+# Anything that counts as a strike for F-Strike%: swings, called strikes, fouls,
+# and balls put in play. (A foul tip is already in _WHIFF_CODES.)
+_STRIKE_CODES = _SWING_CODES | _CALLED_CODES
+
+# ── Gameday pixel -> feet, fitted against AAA games that have BOTH Savant
+# plate_x/plate_z (feet) and a GUMBO feed (pixels). 1,090 matched pitches
+# across 4 games, 3-sigma trimmed:
+#     plate_x: R^2=0.9993, mean error 0.21", max 0.77"
+#     plate_z: R^2=0.9998, mean error 0.13", max 0.49"
+# The two axes have DIFFERENT scales (37.6 vs 26.5 px/ft) — a single assumed
+# constant would be wrong, which is why these are fitted rather than guessed.
+_PX_A, _PX_B = -0.02660355, 3.122211    # plate_x (ft) from coordinates.x
+_PZ_A, _PZ_B = -0.03771641, 8.882287    # plate_z (ft) from coordinates.y
+
+# Zone boundary, grid-fitted on 1,684 AAA pitches against Savant's own `zone`
+# field: 98.69% agreement, Zone% 47.2 vs 47.6. The vertical pad came out at
+# 0.12 ft = 1.44" — a ball radius — because a pitch is in-zone when any part of
+# the ball crosses it, not just its center. The horizontal half-width already
+# carried that allowance.
+_ZONE_HALF_WIDTH = 0.83   # ft from plate center
+_ZONE_PAD = 0.12          # ft, ball radius
+
+
+def _plate_coords(pitch_data):
+    """(plate_x, plate_z) in feet from a GUMBO pitchData block, or (None, None)."""
+    c = (pitch_data or {}).get("coordinates") or {}
+    x, y = c.get("x"), c.get("y")
+    if x is None or y is None:
+        return None, None
+    return _PX_A * x + _PX_B, _PZ_A * y + _PZ_B
+
+
+def _is_in_zone(plate_x, plate_z, sz_top, sz_bot):
+    if plate_x is None or plate_z is None or sz_top is None or sz_bot is None:
+        return None
+    return (
+        abs(plate_x) <= _ZONE_HALF_WIDTH
+        and (sz_bot - _ZONE_PAD) <= plate_z <= (sz_top + _ZONE_PAD)
+    )
 
 # hitData.trajectory buckets. A bunt grounder is a ground ball.
 _GB_TRAJ = frozenset({"ground_ball", "bunt_grounder"})
@@ -185,18 +228,107 @@ def _fetch_feed(game_pk):
     return payload
 
 
+def _new_bucket():
+    return {
+        "tracked_pitches": 0, "whiffs": 0, "called_strikes": 0, "swings": 0,
+        "contact": 0, "in_zone": 0, "zone_known": 0, "o_swings": 0, "o_pitches": 0,
+        "z_swings": 0, "z_contact": 0, "o_contact": 0,
+        "first_pitches": 0, "first_pitch_strikes": 0,
+        "two_strike_pitches": 0,
+        "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0,
+        "soft": 0, "medium": 0, "hard": 0, "hardness_known": 0,
+        "pull": 0, "center": 0, "oppo": 0, "spray_known": 0,
+    }
+
+
+# hitData.location is the fielder position that fielded the ball. Left side of
+# the diamond is 5/6/7, right side 3/4/9, up the middle 1/2/8. Pull vs oppo
+# flips with batter handedness. Two-digit codes (e.g. "78") are gaps — the
+# first digit carries the side.
+_LEFT_SIDE = {"5", "6", "7"}
+_RIGHT_SIDE = {"3", "4", "9"}
+_MIDDLE = {"1", "2", "8"}
+
+
+def _spray_bucket(location, bat_side):
+    """'pull' | 'center' | 'oppo' | None from fielder position + batter hand."""
+    if not location or not bat_side:
+        return None
+    side = str(location)[0]
+    if side in _MIDDLE:
+        return "center"
+    if side in _LEFT_SIDE:
+        return "pull" if bat_side == "R" else "oppo"
+    if side in _RIGHT_SIDE:
+        return "oppo" if bat_side == "R" else "pull"
+    return None
+
+
+def _finalize(m):
+    """Turn raw counters into the published metric dict."""
+    p = m["tracked_pitches"]
+    bip = m["bip"]
+    zk = m["zone_known"]
+    hk = m["hardness_known"]
+    sk = m["spray_known"]
+    return {
+        "tracked_pitches": p,
+        "whiffs": m["whiffs"],
+        "called_strikes": m["called_strikes"],
+        "swings": m["swings"],
+        "csw_pct": _pct(m["whiffs"] + m["called_strikes"], p),
+        "swstr_pct": _pct(m["whiffs"], p),
+        "whiff_pct": _pct(m["whiffs"], m["swings"]),      # whiffs per SWING
+        "swing_pct": _pct(m["swings"], p),
+        "contact_pct": _pct(m["contact"], m["swings"]),
+        # Count-based. first_pitches is exposed so it can be reconciled against
+        # battersFaced and so season aggregates can re-weight the rate.
+        "first_pitches": m["first_pitches"],
+        "first_pitch_strikes": m["first_pitch_strikes"],
+        "f_strike_pct": _pct(m["first_pitch_strikes"], m["first_pitches"]),
+        "two_strike_pitches": m["two_strike_pitches"],
+        "two_str_pct": _pct(m["two_strike_pitches"], p),
+        # Zone (calibrated from Gameday pixels — see _plate_coords)
+        "zone_pct": _pct(m["in_zone"], zk),
+        "o_swing_pct": _pct(m["o_swings"], m["o_pitches"]),
+        "z_swing_pct": _pct(m["z_swings"], m["in_zone"]),
+        "z_contact_pct": _pct(m["z_contact"], m["z_swings"]),
+        "o_contact_pct": _pct(m["o_contact"], m["o_swings"]),
+        # Batted ball
+        "bip": bip,
+        "gb": m["gb"], "fb": m["fb"], "ld": m["ld"], "pu": m["pu"],
+        "gb_pct": _pct(m["gb"], bip),
+        "fb_pct": _pct(m["fb"], bip),
+        "ld_pct": _pct(m["ld"], bip),
+        "pu_pct": _pct(m["pu"], bip),
+        "gb_fb_ratio": _ratio(m["gb"], m["fb"]),
+        # Contact quality (full distribution, not just hard)
+        "soft_pct": _pct(m["soft"], hk),
+        "med_pct": _pct(m["medium"], hk),
+        "hard_pct": _pct(m["hard"], hk),
+        # Spray
+        "pull_pct": _pct(m["pull"], sk),
+        "center_pct": _pct(m["center"], sk),
+        "oppo_pct": _pct(m["oppo"], sk),
+    }
+
+
 def _derive_pitch_metrics(feed):
     """Per-pitcher pitch-level metrics from the play-by-play.
 
-    These levels have no Statcast — no velocity, no pitch type, no movement
-    (verified: startSpeed and details.type are absent on every pitch). But every
-    pitch still carries a CALL, and every ball in play carries a trajectory, so
-    the plate-discipline and batted-ball families are fully recoverable:
+    These levels have no Statcast — no velocity, pitch type or movement
+    (verified: startSpeed and details.type are absent on every pitch at every
+    level). But every pitch carries a CALL, a ball/strike COUNT, a batter
+    HANDEDNESS and a plate LOCATION, and every ball in play carries a
+    trajectory, hardness and fielder. That is enough for five metric families:
 
-        CSW%   = (called strikes + whiffs) / pitches
-        SwStr% = whiffs / pitches
-        GB/FB/LD/PU% = trajectory share of balls in play
-        Hard%  = hardness == "hard" share of balls in play
+        plate discipline  CSW%, SwStr%, Whiff%, Swing%, Contact%
+        count             F-Strike%, 2Str%, PAR%
+        zone              Zone%, O-Swing%, Z-Swing%, Z-Contact%, O-Contact%
+        batted ball       GB/FB/LD/PU%, GB/FB
+        contact quality   Soft/Med/Hard%, Pull/Center/Oppo%
+
+    Each family is also split by batter handedness into `splits.L` / `splits.R`.
 
     Attribution walks the events in order rather than trusting
     `matchup.pitcher.id`, which names the pitcher who FINISHED the plate
@@ -207,85 +339,153 @@ def _derive_pitch_metrics(feed):
     incoming `player.id`, so switching the active pitcher when one appears
     attributes every pitch correctly.
 
-    Batted-ball rates here are over ALL balls in play, unlike the box score's
-    GO/AO which only counts balls in play that became OUTS. Both are exposed;
-    they are different denominators, not a discrepancy.
+    Batted-ball rates are over ALL balls in play, unlike the box score's GO/AO
+    which counts only balls in play that became OUTS. Both are exposed; they
+    are different denominators, not a discrepancy.
     """
     plays = (((feed or {}).get("liveData") or {}).get("plays") or {}).get("allPlays") or []
-    acc = {}
+    overall = {}
+    splits = {}   # {pitcher_id: {"L": bucket, "R": bucket}}
+    # PAR% needs plate-appearance granularity, not pitch granularity.
+    pa_stats = {}  # {pitcher_id: {"two_strike_pas": n, "strikeouts": n}}
 
-    def _bucket(pid):
-        m = acc.get(pid)
-        if m is None:
-            m = acc[pid] = {
-                "tracked_pitches": 0, "whiffs": 0, "called_strikes": 0,
-                "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0, "hard": 0,
-            }
-        return m
+    def buckets_for(pid, bat_side):
+        """Every counter update touches the overall bucket and, when the batter
+        side is known, the matching split bucket."""
+        out = [overall.setdefault(pid, _new_bucket())]
+        if bat_side in ("L", "R"):
+            out.append(splits.setdefault(pid, {}).setdefault(bat_side, _new_bucket()))
+        return out
 
     active = None
     for play in plays:
-        play_pitcher = ((play.get("matchup") or {}).get("pitcher") or {}).get("id")
+        matchup = play.get("matchup") or {}
+        play_pitcher = (matchup.get("pitcher") or {}).get("id")
+        bat_side = ((matchup.get("batSide") or {}).get("code") or "").upper() or None
         events = sorted(play.get("playEvents") or [], key=lambda e: e.get("index", 0))
         has_sub = any(
             (e.get("details") or {}).get("eventType") == "pitching_substitution"
             for e in events
         )
-        # No substitution in this PA -> matchup.pitcher owns all of it and is
-        # the most reliable signal. Otherwise carry the previous PA's pitcher in
-        # and let the substitution events move it.
         current = play_pitcher if not has_sub else (active if active is not None else play_pitcher)
+
+        reached_two_strikes = False
+        pa_ending_pitcher = current
+        # GUMBO's `count` on a pitch event is the count AFTER that pitch, not
+        # before it — verified against full PA sequences (a called strike on 0-0
+        # reports 0-1). Metrics keyed on the count a pitch was THROWN in must
+        # therefore use the previous event's count, which is what prev_count
+        # carries. Naively reading `count` made F-Strike% match only
+        # first-pitch balls in play (the one case where the count doesn't
+        # advance) and report 100%.
+        prev_count = (0, 0)
         for e in events:
-            if (e.get("details") or {}).get("eventType") == "pitching_substitution":
+            details = e.get("details") or {}
+            if details.get("eventType") == "pitching_substitution":
                 new_pid = (e.get("player") or {}).get("id")
                 if new_pid is not None:
                     current = new_pid
                 continue
             if current is None:
                 continue
+
             if e.get("isPitch"):
-                m = _bucket(current)
-                m["tracked_pitches"] += 1
-                code = ((e.get("details") or {}).get("call") or {}).get("code")
-                if code in _WHIFF_CODES:
-                    m["whiffs"] += 1
-                elif code in _CALLED_CODES:
-                    m["called_strikes"] += 1
+                code = (details.get("call") or {}).get("code")
+                after = e.get("count") or {}
+                # The count this pitch was thrown IN.
+                balls, strikes = prev_count
+                is_first_pitch = (e.get("pitchNumber") == 1) or (balls == 0 and strikes == 0)
+                pitch_data = e.get("pitchData") or {}
+                plate_x, plate_z = _plate_coords(pitch_data)
+                in_zone = _is_in_zone(
+                    plate_x, plate_z,
+                    pitch_data.get("strikeZoneTop"), pitch_data.get("strikeZoneBottom"),
+                )
+                is_swing = code in _SWING_CODES
+                is_contact = code in _CONTACT_CODES
+
+                for m in buckets_for(current, bat_side):
+                    m["tracked_pitches"] += 1
+                    if code in _WHIFF_CODES:
+                        m["whiffs"] += 1
+                    elif code in _CALLED_CODES:
+                        m["called_strikes"] += 1
+                    if is_swing:
+                        m["swings"] += 1
+                    if is_contact:
+                        m["contact"] += 1
+                    if is_first_pitch:
+                        m["first_pitches"] += 1
+                        if code in _STRIKE_CODES:
+                            m["first_pitch_strikes"] += 1
+                    if strikes == 2:
+                        m["two_strike_pitches"] += 1
+                    if in_zone is not None:
+                        m["zone_known"] += 1
+                        if in_zone:
+                            m["in_zone"] += 1
+                            if is_swing:
+                                m["z_swings"] += 1
+                                if is_contact:
+                                    m["z_contact"] += 1
+                        else:
+                            m["o_pitches"] += 1
+                            if is_swing:
+                                m["o_swings"] += 1
+                                if is_contact:
+                                    m["o_contact"] += 1
+                if (after.get("strikes") or 0) >= 2:
+                    reached_two_strikes = True
+                prev_count = (after.get("balls") or 0, after.get("strikes") or 0)
+                pa_ending_pitcher = current
+
             hd = e.get("hitData")
             if hd:
-                m = _bucket(current)
-                m["bip"] += 1
                 traj = hd.get("trajectory")
-                if traj in _GB_TRAJ:
-                    m["gb"] += 1
-                elif traj in _FB_TRAJ:
-                    m["fb"] += 1
-                elif traj in _LD_TRAJ:
-                    m["ld"] += 1
-                elif traj in _PU_TRAJ:
-                    m["pu"] += 1
-                if hd.get("hardness") == "hard":
-                    m["hard"] += 1
+                hardness = hd.get("hardness")
+                spray = _spray_bucket(hd.get("location"), bat_side)
+                for m in buckets_for(current, bat_side):
+                    m["bip"] += 1
+                    if traj in _GB_TRAJ:
+                        m["gb"] += 1
+                    elif traj in _FB_TRAJ:
+                        m["fb"] += 1
+                    elif traj in _LD_TRAJ:
+                        m["ld"] += 1
+                    elif traj in _PU_TRAJ:
+                        m["pu"] += 1
+                    if hardness in ("soft", "medium", "hard"):
+                        m["hardness_known"] += 1
+                        m[hardness] += 1
+                    if spray:
+                        m["spray_known"] += 1
+                        m[spray] += 1
+
+        # PAR%: strikeouts as a share of the plate appearances that reached two
+        # strikes. Credited to whoever finished the PA, matching how the box
+        # score assigns the strikeout.
+        if pa_ending_pitcher is not None and reached_two_strikes:
+            st = pa_stats.setdefault(pa_ending_pitcher, {"two_strike_pas": 0, "strikeouts": 0})
+            st["two_strike_pas"] += 1
+            event_type = ((play.get("result") or {}).get("eventType") or "")
+            if event_type.startswith("strikeout"):
+                st["strikeouts"] += 1
+
         if current is not None:
             active = current
 
     out = {}
-    for pid, m in acc.items():
-        p, bip = m["tracked_pitches"], m["bip"]
-        out[int(pid)] = {
-            "tracked_pitches": p,
-            "whiffs": m["whiffs"],
-            "called_strikes": m["called_strikes"],
-            "csw_pct": _pct(m["whiffs"] + m["called_strikes"], p),
-            "swstr_pct": _pct(m["whiffs"], p),
-            "bip": bip,
-            "gb": m["gb"], "fb": m["fb"], "ld": m["ld"], "pu": m["pu"],
-            "gb_pct": _pct(m["gb"], bip),
-            "fb_pct": _pct(m["fb"], bip),
-            "ld_pct": _pct(m["ld"], bip),
-            "pu_pct": _pct(m["pu"], bip),
-            "hard_pct": _pct(m["hard"], bip),
-        }
+    for pid, m in overall.items():
+        rec = _finalize(m)
+        st = pa_stats.get(pid) or {}
+        rec["two_strike_pas"] = st.get("two_strike_pas", 0)
+        rec["par_pct"] = _pct(st.get("strikeouts", 0), st.get("two_strike_pas", 0))
+        side_recs = {}
+        for side, sm in (splits.get(pid) or {}).items():
+            side_recs[side] = _finalize(sm)
+        if side_recs:
+            rec["splits"] = side_recs
+        out[int(pid)] = rec
     return out
 
 

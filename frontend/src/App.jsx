@@ -8,7 +8,7 @@ import Scoreboard from "./components/Scoreboard";
 import PlayByPlayModal from "./components/PlayByPlayModal";
 import ReclassifyModal from "./components/ReclassifyModal";
 import SearchBar from "./components/SearchBar";
-import AdaptedResultsTable from "./components/AdaptedResultsTable";
+import AdaptedResultsTable, { ADAPTED_COLUMNS, ADAPTED_DEFAULT_HIDDEN } from "./components/AdaptedResultsTable";
 import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, DEFAULT_LEVEL } from "./utils/api";
 import { PITCH_TYPE_FILTERS, PITCH_COLORS, TEAM_FULL_NAMES, PITCHER_RESULTS_COLUMNS } from "./constants";
 import usePersistentState from "./hooks/usePersistentState";
@@ -25,6 +25,14 @@ import {
   openHashesInNewTabs,
   scrollToTopAfterRender,
 } from "./utils/navigation";
+
+// Columns dropdown sections for the adapted (non-Statcast) table.
+const ADAPTED_COLUMN_GROUPS = Object.entries(
+  ADAPTED_COLUMNS.filter(c => c.key !== "pitcher").reduce((acc, c) => {
+    (acc[c.group || "Other"] = acc[c.group || "Other"] || []).push(c);
+    return acc;
+  }, {}),
+);
 
 // Lazy-load pages that aren't needed on initial render
 const TeamPage = lazy(() => import("./components/TeamPage"));
@@ -85,6 +93,10 @@ export default function App() {
   const [levelMeta, setLevelMeta] = useState(null);
   const [pitchFilter, setPitchFilter] = useState("Four-Seamer");
   const [resultsHiddenCols, setResultsHiddenCols] = useState(["team", "hand"]);
+  // The adapted table has far more columns than the Statcast one (five metric
+  // families), so most open hidden and the Columns dropdown reveals them.
+  const [adaptedHiddenCols, setAdaptedHiddenCols] = usePersistentState(
+    "pl_milb_adapted_hidden", ADAPTED_DEFAULT_HIDDEN);
   const [showColFilter, setShowColFilter] = useState(false);
   // Shown after a plain click on Create Tabs, where the browser will move
   // focus to the last opened tab and the page can't prevent it.
@@ -895,12 +907,26 @@ export default function App() {
                       </button>
                       {showColFilter && (
                         <div className="col-filter-dropdown">
-                          {PITCHER_RESULTS_COLUMNS.filter(c => c.key !== "pitcher").map(c => (
-                            <label key={c.key} className="col-filter-label">
-                              <input type="checkbox" checked={!resultsHiddenCols.includes(c.key)} onChange={() => setResultsHiddenCols(prev => prev.includes(c.key) ? prev.filter(k => k !== c.key) : [...prev, c.key])} />
-                              {c.label}
-                            </label>
-                          ))}
+                          {/* The adapted table carries five metric families, so its
+                              options are grouped and most start hidden. */}
+                          {isStatcastLevel
+                            ? PITCHER_RESULTS_COLUMNS.filter(c => c.key !== "pitcher").map(c => (
+                                <label key={c.key} className="col-filter-label">
+                                  <input type="checkbox" checked={!resultsHiddenCols.includes(c.key)} onChange={() => setResultsHiddenCols(prev => prev.includes(c.key) ? prev.filter(k => k !== c.key) : [...prev, c.key])} />
+                                  {c.label}
+                                </label>
+                              ))
+                            : ADAPTED_COLUMN_GROUPS.map(([group, cols]) => (
+                                <React.Fragment key={group}>
+                                  <div className="col-filter-group">{group}</div>
+                                  {cols.map(c => (
+                                    <label key={c.key} className="col-filter-label" title={c.title || undefined}>
+                                      <input type="checkbox" checked={!adaptedHiddenCols.includes(c.key)} onChange={() => setAdaptedHiddenCols(prev => prev.includes(c.key) ? prev.filter(k => k !== c.key) : [...prev, c.key])} />
+                                      {c.label}
+                                    </label>
+                                  ))}
+                                </React.Fragment>
+                              ))}
                         </div>
                       )}
                     </div>
@@ -963,7 +989,7 @@ export default function App() {
               )}
               {/* Below AAA the box score is all there is — adapted columns only. */}
               {!isStatcastLevel && (
-                <AdaptedResultsTable data={filteredResultsData} level={level} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
+                <AdaptedResultsTable data={filteredResultsData} level={level} hiddenCols={adaptedHiddenCols} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
             </div>
           </div>

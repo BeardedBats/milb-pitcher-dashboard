@@ -165,7 +165,12 @@ _override_version = 0  # Incremented on every save/remove to bust agg caches
 #      multi-level game log both changed shape, and `daily_results_box_*`
 #      embeds this version — without the bump those keys keep serving the old
 #      metric-less rows.
-CARD_SCHEMA_VERSION = 45
+#   46: non-Statcast pitch metrics expanded to five families — count
+#      (F-Strike%, 2Str%, PAR%), zone (Zone%, O/Z-Swing%, O/Z-Contact%, from
+#      Gameday coordinates calibrated against AAA Savant), full contact quality
+#      (Soft/Med/Hard), spray (Pull/Center/Oppo) and per-batter-hand splits.
+#      Adapted rows and the multi-level game log both changed shape again.
+CARD_SCHEMA_VERSION = 46
 
 STAT_LINES_REFRESH_PREFIX = "stat_lines_refresh"
 RANGE_DAY_PREFIX = "range_day"

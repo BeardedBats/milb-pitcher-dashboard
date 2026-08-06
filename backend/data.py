@@ -159,7 +159,13 @@ _override_version = 0  # Incremented on every save/remove to bust agg caches
 #      player-page payloads gained level tags and (org, level) team display.
 #      Nothing cached under v43 describes minor-league games, so this bump
 #      evicts the entire prior cache.
-CARD_SCHEMA_VERSION = 44
+#   45: non-Statcast levels gained pitch-level metrics derived from the live
+#      feed's play-by-play (whiffs, swstr_pct, csw_pct, gb/fb/ld/pu_pct,
+#      hard_pct, tracked_pitches, bip). The adapted result rows and the
+#      multi-level game log both changed shape, and `daily_results_box_*`
+#      embeds this version — without the bump those keys keep serving the old
+#      metric-less rows.
+CARD_SCHEMA_VERSION = 45
 
 STAT_LINES_REFRESH_PREFIX = "stat_lines_refresh"
 RANGE_DAY_PREFIX = "range_day"

@@ -1480,38 +1480,50 @@ def org_page(
     if cached is not None:
         return cached
 
-    # AAA rows come from the Statcast range (same source as the main table's
-    # team-separation mode); everything below comes from the box-score path.
-    df = fetch_date_range_materialized(start_date, end_date)
-    if df is None:
-        # Season range still warming. Say so (202) rather than rendering an
-        # empty AAA table that looks like "this org has no pitchers".
-        return _loading_response(response, start_date, end_date)
+    # Every affiliate — INCLUDING AAA — is built from the per-team season
+    # endpoint, one request each. That is the whole page's data.
+    #
+    # This used to require the materialized Statcast range for AAA and 202 when
+    # it was missing, which made team pages unloadable whenever materialization
+    # was behind (and permanently unloadable once a timed-out job left its
+    # status stuck on "running"). A team page must not be hostage to a
+    # season-wide cache: it now always renders, and AAA is UPGRADED in place
+    # with Statcast columns only if the range happens to be ready.
     season_year = int(start_date[:4])
     blocks = []
     for meta in affiliates:
         code = meta["level"]
-        abbrev = meta["abbrev"]
-        rows = []
-        if code == "AAA" and df is not None and not df.empty and "pitcher_team" in df.columns:
-            tdf = df[df["pitcher_team"] == abbrev]
-            if "level" in tdf.columns:
-                tdf = tdf[tdf["level"] == "AAA"]
-            if not tdf.empty:
-                rows = tag_mlb_experience(aggregate_pitcher_results_range(tdf))
-        else:
-            # Non-Statcast affiliate: one season-stats call per team beats
-            # walking its whole schedule for box scores.
-            rows = tag_mlb_experience(get_team_season_pitchers(meta["team_id"], code, season_year))
+        rows = tag_mlb_experience(get_team_season_pitchers(meta["team_id"], code, season_year))
         blocks.append({
             "level": code,
             "team_id": meta["team_id"],
-            "team": abbrev,
+            "team": meta["abbrev"],
             "team_name": meta["name"],
             "team_display": team_display_name(team_id=meta["team_id"], level=code),
-            "statcast": code in STATCAST_LEVELS,
+            # Statcast columns are only meaningful once the AAA upgrade below
+            # succeeds; otherwise the block renders the box-score column set.
+            "statcast": False,
             "rows": rows,
         })
+
+    # Optional AAA upgrade: richer per-pitch columns (CSW%, whiffs) when the
+    # season range is materialized. Never blocks the response.
+    try:
+        df = fetch_date_range_materialized(start_date, end_date)
+    except Exception as e:
+        print(f"[OrgPage] materialized range lookup failed: {e}")
+        df = None
+    if df is not None and not df.empty and "pitcher_team" in df.columns:
+        for block in blocks:
+            if block["level"] != "AAA":
+                continue
+            tdf = df[df["pitcher_team"] == block["team"]]
+            if "level" in tdf.columns:
+                tdf = tdf[tdf["level"] == "AAA"]
+            if not tdf.empty:
+                block["rows"] = tag_mlb_experience(aggregate_pitcher_results_range(tdf))
+                block["statcast"] = True
+
     payload = {"org": org, "affiliates": blocks}
     if any(b["rows"] for b in blocks):
         set_agg_cache(agg_key, payload)
@@ -1678,7 +1690,9 @@ def cron_materialize_ranges(request: Request, response: Response, max_jobs: int 
     if denied:
         return denied
     try:
-        drained = drain_pending_materializations(max_jobs=max_jobs)
+        # Leave headroom inside the 300s limit so the job can write its
+        # heartbeat and, if it finished, its ready state before being killed.
+        drained = drain_pending_materializations(max_jobs=max_jobs, deadline=time.time() + 240)
         return {"status": "ok", "count": len(drained), "drained": drained}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")

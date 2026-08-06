@@ -1533,7 +1533,21 @@ def queue_range_materialization(start_date, end_date):
         }
     current = redis_get(_materialize_status_key(start_date, end_date)) or {}
     if current.get("status") in ("pending", "running"):
-        return {**current, "queued": False}
+        # A job whose function was killed mid-run leaves its status on
+        # "running" with no further heartbeat. Without this check that state is
+        # terminal: the guard below keeps returning "running", the token is
+        # never re-queued, and every range-backed endpoint 202s forever. Treat a
+        # silent job as dead and let it be picked up again.
+        beat = current.get("heartbeat")
+        stale = beat is None or (time.time() - float(beat)) > MATERIALIZE_STALE_AFTER
+        if not stale:
+            return {**current, "queued": False}
+        print(f"[Materialize] {start_date}:{end_date} looks stuck (no heartbeat) — re-queuing")
+        redis_sadd(MATERIALIZE_PENDING_KEY, _materialize_range_token(start_date, end_date),
+                   ttl=MATERIALIZE_STATUS_TTL)
+        payload = {"status": "pending", "heartbeat": time.time()}
+        redis_set(_materialize_status_key(start_date, end_date), payload, ttl=MATERIALIZE_STATUS_TTL)
+        return {**payload, "queued": True}
     payload = {"status": "pending"}
     redis_set(_materialize_status_key(start_date, end_date), payload, ttl=MATERIALIZE_STATUS_TTL)
     redis_sadd(MATERIALIZE_PENDING_KEY, _materialize_range_token(start_date, end_date), ttl=MATERIALIZE_STATUS_TTL)
@@ -1803,8 +1817,38 @@ def fetch_date_range_materialized(start_date, end_date):
     return _merge_daily_cache(persisted, start_date, end_date)
 
 
-def drain_pending_materializations(max_jobs=1):
-    """Drain Redis-backed materialization jobs. Intended for cron/manual triggers."""
+def missing_range_days(start_date, end_date):
+    """Days in the window with no persisted range_day snapshot yet."""
+    missing = []
+    for day in _date_strings(start_date, end_date):
+        if _is_today(day):
+            continue  # today is fetched live, never baked
+        if _load_range_day(day) is _MISSING_RANGE_DAY:
+            missing.append(day)
+    return missing
+
+
+# How many days one cron invocation will bake. A full season is ~134 days and
+# each day costs a Savant pull plus a schedule lookup per Statcast level, so
+# doing the whole range in one go blows the 300s function limit — the process
+# is killed before it can write "ready" or clear the pending token, leaving the
+# job stuck on "running" forever and every range-backed endpoint stuck on 202.
+# Bounded slices make the work resumable: each tick advances it, and the
+# 5-minute cron converges on a full season within a couple of hours.
+MATERIALIZE_DAYS_PER_RUN = 12
+# A job whose heartbeat is older than this is presumed dead (function killed
+# mid-flight) and becomes eligible to run again.
+MATERIALIZE_STALE_AFTER = 15 * 60
+
+
+def drain_pending_materializations(max_jobs=1, deadline=None):
+    """Advance Redis-backed materialization jobs INCREMENTALLY.
+
+    Bakes at most MATERIALIZE_DAYS_PER_RUN missing days per call, writing a
+    heartbeat as it goes, and only marks the job ready once no days are left.
+    Safe to be killed at any point — the next tick picks up where this stopped,
+    because progress lives in the per-day snapshots, not in the job record.
+    """
     tokens = sorted(redis_smembers(MATERIALIZE_PENDING_KEY))
     drained = []
     for token in tokens[:max(1, int(max_jobs or 1))]:
@@ -1814,12 +1858,40 @@ def drain_pending_materializations(max_jobs=1):
             redis_srem(MATERIALIZE_PENDING_KEY, token)
             continue
         status_key = _materialize_status_key(start_date, end_date)
-        redis_set(status_key, {"status": "running"}, ttl=MATERIALIZE_STATUS_TTL)
         try:
-            fetch_date_range(start_date, end_date)
-            redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
-            redis_srem(MATERIALIZE_PENDING_KEY, token)
-            drained.append({"start_date": start_date, "end_date": end_date, "status": "ready"})
+            missing = missing_range_days(start_date, end_date)
+            if not missing:
+                redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
+                redis_srem(MATERIALIZE_PENDING_KEY, token)
+                drained.append({"start_date": start_date, "end_date": end_date,
+                                "status": "ready", "days_done": 0, "days_left": 0})
+                continue
+
+            baked = 0
+            for day in missing[:MATERIALIZE_DAYS_PER_RUN]:
+                if deadline is not None and time.time() >= deadline:
+                    break
+                try:
+                    fetch_date(day)   # persists this day's range_day snapshot
+                    baked += 1
+                except Exception as e:
+                    print(f"[Materialize] {day} failed: {e}")
+                # Heartbeat after each day so a stuck job is detectable.
+                redis_set(status_key, {
+                    "status": "running",
+                    "heartbeat": time.time(),
+                    "days_left": max(0, len(missing) - baked),
+                }, ttl=MATERIALIZE_STATUS_TTL)
+
+            remaining = len(missing) - baked
+            if remaining <= 0:
+                redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
+                redis_srem(MATERIALIZE_PENDING_KEY, token)
+                status = "ready"
+            else:
+                status = "running"
+            drained.append({"start_date": start_date, "end_date": end_date,
+                            "status": status, "days_done": baked, "days_left": max(0, remaining)})
         except Exception as e:
             message = str(e)[:500]
             redis_set(status_key, {"status": "error", "error": message}, ttl=MATERIALIZE_STATUS_TTL)

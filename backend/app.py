@@ -54,6 +54,7 @@ from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers,
     enrich_log_with_pitch_metrics, get_game_pitch_metrics,
+    _METRICS_VERSION,
 )
 from redis_cache import redis_get, redis_set, redis_delete
 
@@ -244,7 +245,7 @@ def pitcher_results(
     # off the box score and carry the adapted column set (Str%, GO/AO) instead
     # of Statcast-derived metrics.
     if not is_statcast_level(level):
-        agg_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}_{date}"
+        agg_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
         cached = get_agg_cache(agg_key)
         if cached is not None:
             rows = cached
@@ -322,7 +323,7 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
 
     if not is_statcast_level(level):
         # Box-score-only level: no pitch data, adapted results table.
-        box_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}_{date}"
+        box_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
         rows = get_agg_cache(box_key)
         if rows is None:
             rows = get_level_results(date, level, games=games_list)
@@ -1678,7 +1679,7 @@ def cron_stat_corrections(request: Request, response: Response, days_back: int =
             for code in LEVEL_ORDER:
                 if code in STATCAST_LEVELS:
                     continue
-                key = f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{date_str}"
+                key = f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date_str}"
                 try:
                     redis_delete(f"agg:{key}")
                     box_cleared += 1
@@ -1739,7 +1740,7 @@ def cron_warmup_daily(request: Request, response: Response):
                     # per-game metric cache that player-page logs read.
                     rows = get_level_results(default_date, code)
                     if rows:
-                        set_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{default_date}", rows)
+                        set_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{default_date}", rows)
                 warmed.append(code)
             except Exception as e:
                 print(f"[WarmupDaily] {code} failed: {e}")
@@ -1858,7 +1859,7 @@ def cron_warmup_daily_players(request: Request, response: Response):
                     rows = get_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
                         or aggregate_pitcher_results(default_date, None, level=code)
                 else:
-                    rows = get_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
+                    rows = get_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{default_date}") \
                         or get_level_results(default_date, code)
                 pitcher_ids.update(int(r["pitcher_id"]) for r in (rows or []) if r.get("pitcher_id"))
             except Exception as e:

@@ -1701,15 +1701,42 @@ def _load_persisted_range(start_date, end_date):
             return None  # materialized but gameless day — no frame
         return day
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        day_results = list(pool.map(_read_day, date_list))
+    # Cheap pre-check BEFORE loading anything. This path is not rare: it runs on
+    # every 202, because _loading_response -> queue_range_materialization ->
+    # fetch_date_range_materialized -> here. Loading a whole season of
+    # decompressed Statcast only to discover day 57 is absent, return None and
+    # throw it all away, is the single most expensive way to say "not ready".
+    #
+    # missing_range_days is one SMEMBERS. It can UNDER-report, though: the
+    # membership marker was added later than the snapshots themselves, so a day
+    # baked before it existed has a snapshot but no marker. Confirm with a
+    # single real GET before trusting a "missing" verdict — one wasted GET on
+    # the stale-marker path, versus ~110 on every 202 without this.
+    probably_missing = missing_range_days(start_date, end_date)
+    if probably_missing and _load_range_day(probably_missing[0]) is None:
+        return None
 
-    frames = []
-    for day in day_results:
-        if day is _MISSING_RANGE_DAY:
-            return None
-        if day is not None:
-            frames.append(day)
+    # Bail on the FIRST missing day rather than materializing every day and
+    # checking afterwards. Submitting up front keeps the parallel fetch (the
+    # round-trips are the slow part); consuming in date order stops frames
+    # accumulating past the point the range is known incomplete. Reads already
+    # running still finish — cancellation only reaches queued days — so this
+    # bounds memory and latency, not GET count. The pre-check above is what
+    # makes the common not-ready case cheap.
+    pool = ThreadPoolExecutor(max_workers=8)
+    try:
+        futures = [pool.submit(_read_day, date_str) for date_str in date_list]
+        frames = []
+        for fut in futures:
+            day = fut.result()
+            if day is _MISSING_RANGE_DAY:
+                return None
+            if day is not None:
+                frames.append(day)
+    finally:
+        # cancel_futures so an early return doesn't block on days we no longer
+        # need; the default shutdown(wait=True) would wait for all of them.
+        pool.shutdown(wait=False, cancel_futures=True)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)

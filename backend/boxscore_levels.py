@@ -102,6 +102,17 @@ _box_lock = threading.Lock()
 _MILB_CACHE_PREFIX = "milb"
 _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 
+# BUMP THIS whenever the shape of a derived row or a metrics dict changes.
+#
+# Every Redis key in this module embeds it. That is not belt-and-braces: the
+# derived-row key has a 30-day TTL and sits BEHIND the daily agg key, so
+# bumping only CARD_SCHEMA_VERSION is not enough — the daily key misses,
+# recomputes, and then reads month-old rows straight back out of this cache.
+# That is exactly what shipped v45's metrics to a v46 deploy.
+#   1: initial derived rows (whiffs, CSW%, SwStr%, GB/FB/LD, Hard%)
+#   2: five metric families + per-hand splits
+_METRICS_VERSION = 2
+
 
 def _l2_get(key):
     try:
@@ -500,13 +511,13 @@ def _rows_for_game(game, level):
     daily cron accumulate a season of pitch metrics that player-page game logs
     then read for free. A live game's rows cache for a minute.
 
-    The cache version suffix (v2) is bumped when the derived row shape changes,
-    so old entries without the pitch metrics are not served.
+    The key embeds _METRICS_VERSION so a shape change can never serve stale
+    rows — see the note on that constant.
     """
     is_final = (game.get("abstract_state") == "Final")
     ttl = _BOX_TTL_FINAL if is_final else _BOX_TTL_LIVE
     game_pk = int(game["game_pk"])
-    redis_key = f"{_MILB_CACHE_PREFIX}:rows:v2:{level}:{game_pk}:{'F' if is_final else 'L'}"
+    redis_key = f"{_MILB_CACHE_PREFIX}:rows:v{_METRICS_VERSION}:{level}:{game_pk}:{'F' if is_final else 'L'}"
     return _two_tier(
         _rows_cache, (game_pk, level, is_final), redis_key, ttl,
         lambda: _build_rows_for_game(game, level),
@@ -861,7 +872,7 @@ def get_game_pitch_metrics(game_pk, allow_fetch=True):
     hit = _pm_cache.get(game_pk)
     if hit and (now - hit[0]) < _BOX_TTL_FINAL:
         return hit[1]
-    key = f"{_MILB_CACHE_PREFIX}:pm:{game_pk}"
+    key = f"{_MILB_CACHE_PREFIX}:pm:v{_METRICS_VERSION}:{game_pk}"
     cached = _l2_get(key)
     if cached is not None:
         # Redis JSON keys are strings; restore int keys for caller lookups.

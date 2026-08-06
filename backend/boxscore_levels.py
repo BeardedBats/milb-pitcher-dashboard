@@ -24,12 +24,29 @@ from levels import (
 )
 
 _BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
+# The live feed carries the box score AND the play-by-play in one response, so
+# reading it costs the same one request as /boxscore but also yields per-pitch
+# call codes and batted-ball trajectories. That is the whole reason the
+# non-Statcast levels can have CSW%/SwStr%/GB% at all.
+_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+
+# Pitch-result call codes (details.call.code) present at every MiLB level.
+# A foul tip is a whiff — same convention the Statcast pipeline uses (see
+# data._reclassify_strikeout_fouls), so CSW/SwStr agree across the two paths.
+_WHIFF_CODES = frozenset({"S", "W", "T"})   # swinging, swinging-blocked, foul tip
+_CALLED_CODES = frozenset({"C"})            # called strike
+
+# hitData.trajectory buckets. A bunt grounder is a ground ball.
+_GB_TRAJ = frozenset({"ground_ball", "bunt_grounder"})
+_FB_TRAJ = frozenset({"fly_ball"})
+_LD_TRAJ = frozenset({"line_drive"})
+_PU_TRAJ = frozenset({"popup"})
 _GAMELOG_URL = (
     "https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats"
     "?stats=gameLog&group=pitching&season={season}&sportId={sport_id}"
 )
 
-_BOX_TTL_FINAL = 24 * 3600
+_BOX_TTL_FINAL = 30 * 24 * 3600
 _BOX_TTL_LIVE = 60
 _box_cache = {}  # { game_pk: (timestamp, is_final, payload) }
 _box_lock = threading.Lock()
@@ -140,7 +157,12 @@ def _decision_from_note(note):
     return m.group(1) if m else ""
 
 
-def _fetch_boxscore(game_pk):
+def _fetch_feed(game_pk):
+    """One live-feed pull per game — box score + play-by-play together.
+
+    L1 only: a feed is 1-3 MB, far too big for Redis. What DOES go to Redis is
+    the small derived row set built from it (see _rows_for_game).
+    """
     game_pk = int(game_pk)
     now = time.time()
     with _box_lock:
@@ -150,15 +172,121 @@ def _fetch_boxscore(game_pk):
         if is_final or (now - ts) < _BOX_TTL_LIVE:
             return payload
     try:
-        resp = requests.get(_BOXSCORE_URL.format(game_pk=game_pk), timeout=15)
+        resp = requests.get(_FEED_URL.format(game_pk=game_pk), timeout=20)
         resp.raise_for_status()
         payload = resp.json()
     except Exception as e:
-        print(f"[BoxLevels] boxscore fetch failed for {game_pk}: {e}")
+        print(f"[BoxLevels] feed fetch failed for {game_pk}: {e}")
         return None
+    state = (((payload.get("gameData") or {}).get("status") or {})
+             .get("abstractGameState"))
     with _box_lock:
-        _box_cache[game_pk] = (now, True, payload)
+        _box_cache[game_pk] = (now, state == "Final", payload)
     return payload
+
+
+def _derive_pitch_metrics(feed):
+    """Per-pitcher pitch-level metrics from the play-by-play.
+
+    These levels have no Statcast — no velocity, no pitch type, no movement
+    (verified: startSpeed and details.type are absent on every pitch). But every
+    pitch still carries a CALL, and every ball in play carries a trajectory, so
+    the plate-discipline and batted-ball families are fully recoverable:
+
+        CSW%   = (called strikes + whiffs) / pitches
+        SwStr% = whiffs / pitches
+        GB/FB/LD/PU% = trajectory share of balls in play
+        Hard%  = hardness == "hard" share of balls in play
+
+    Attribution walks the events in order rather than trusting
+    `matchup.pitcher.id`, which names the pitcher who FINISHED the plate
+    appearance. On a mid-PA pitching change that misfiles every pitch the
+    departing pitcher threw in that PA — observed on 2026-07-30 in Rookie game
+    849353, where 3 pitches moved from De La Cruz to Martinez while the game
+    total still reconciled. `pitching_substitution` action events carry the
+    incoming `player.id`, so switching the active pitcher when one appears
+    attributes every pitch correctly.
+
+    Batted-ball rates here are over ALL balls in play, unlike the box score's
+    GO/AO which only counts balls in play that became OUTS. Both are exposed;
+    they are different denominators, not a discrepancy.
+    """
+    plays = (((feed or {}).get("liveData") or {}).get("plays") or {}).get("allPlays") or []
+    acc = {}
+
+    def _bucket(pid):
+        m = acc.get(pid)
+        if m is None:
+            m = acc[pid] = {
+                "tracked_pitches": 0, "whiffs": 0, "called_strikes": 0,
+                "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0, "hard": 0,
+            }
+        return m
+
+    active = None
+    for play in plays:
+        play_pitcher = ((play.get("matchup") or {}).get("pitcher") or {}).get("id")
+        events = sorted(play.get("playEvents") or [], key=lambda e: e.get("index", 0))
+        has_sub = any(
+            (e.get("details") or {}).get("eventType") == "pitching_substitution"
+            for e in events
+        )
+        # No substitution in this PA -> matchup.pitcher owns all of it and is
+        # the most reliable signal. Otherwise carry the previous PA's pitcher in
+        # and let the substitution events move it.
+        current = play_pitcher if not has_sub else (active if active is not None else play_pitcher)
+        for e in events:
+            if (e.get("details") or {}).get("eventType") == "pitching_substitution":
+                new_pid = (e.get("player") or {}).get("id")
+                if new_pid is not None:
+                    current = new_pid
+                continue
+            if current is None:
+                continue
+            if e.get("isPitch"):
+                m = _bucket(current)
+                m["tracked_pitches"] += 1
+                code = ((e.get("details") or {}).get("call") or {}).get("code")
+                if code in _WHIFF_CODES:
+                    m["whiffs"] += 1
+                elif code in _CALLED_CODES:
+                    m["called_strikes"] += 1
+            hd = e.get("hitData")
+            if hd:
+                m = _bucket(current)
+                m["bip"] += 1
+                traj = hd.get("trajectory")
+                if traj in _GB_TRAJ:
+                    m["gb"] += 1
+                elif traj in _FB_TRAJ:
+                    m["fb"] += 1
+                elif traj in _LD_TRAJ:
+                    m["ld"] += 1
+                elif traj in _PU_TRAJ:
+                    m["pu"] += 1
+                if hd.get("hardness") == "hard":
+                    m["hard"] += 1
+        if current is not None:
+            active = current
+
+    out = {}
+    for pid, m in acc.items():
+        p, bip = m["tracked_pitches"], m["bip"]
+        out[int(pid)] = {
+            "tracked_pitches": p,
+            "whiffs": m["whiffs"],
+            "called_strikes": m["called_strikes"],
+            "csw_pct": _pct(m["whiffs"] + m["called_strikes"], p),
+            "swstr_pct": _pct(m["whiffs"], p),
+            "bip": bip,
+            "gb": m["gb"], "fb": m["fb"], "ld": m["ld"], "pu": m["pu"],
+            "gb_pct": _pct(m["gb"], bip),
+            "fb_pct": _pct(m["fb"], bip),
+            "ld_pct": _pct(m["ld"], bip),
+            "pu_pct": _pct(m["pu"], bip),
+            "hard_pct": _pct(m["hard"], bip),
+        }
+    return out
 
 
 def _rows_for_game(game, level):
@@ -168,13 +296,17 @@ def _rows_for_game(game, level):
     hundreds of KB and would blow past Upstash's per-request limit for a full
     slate, while the rows for one game are a few KB.
 
-    A final game's rows never change, so they cache for a day; a live game's
-    cache for a minute so the table keeps moving.
+    A final game's rows never change, so they cache for 30 days — that lets the
+    daily cron accumulate a season of pitch metrics that player-page game logs
+    then read for free. A live game's rows cache for a minute.
+
+    The cache version suffix (v2) is bumped when the derived row shape changes,
+    so old entries without the pitch metrics are not served.
     """
     is_final = (game.get("abstract_state") == "Final")
     ttl = _BOX_TTL_FINAL if is_final else _BOX_TTL_LIVE
     game_pk = int(game["game_pk"])
-    redis_key = f"{_MILB_CACHE_PREFIX}:rows:{level}:{game_pk}:{'F' if is_final else 'L'}"
+    redis_key = f"{_MILB_CACHE_PREFIX}:rows:v2:{level}:{game_pk}:{'F' if is_final else 'L'}"
     return _two_tier(
         _rows_cache, (game_pk, level, is_final), redis_key, ttl,
         lambda: _build_rows_for_game(game, level),
@@ -182,10 +314,16 @@ def _rows_for_game(game, level):
 
 
 def _build_rows_for_game(game, level):
-    """Adapted result rows for one game's pitchers (both sides)."""
-    box = _fetch_boxscore(game["game_pk"])
-    if not box:
+    """Adapted result rows for one game's pitchers (both sides).
+
+    Official counting stats come from the box score; plate-discipline and
+    batted-ball rates are derived from the same feed's play-by-play.
+    """
+    feed = _fetch_feed(game["game_pk"])
+    if not feed:
         return []
+    box = ((feed.get("liveData") or {}).get("boxscore")) or {}
+    metrics = _derive_pitch_metrics(feed)
     rows = []
     for side in ("away", "home"):
         team_box = (box.get("teams") or {}).get(side) or {}
@@ -242,6 +380,10 @@ def _build_rows_for_game(game, level):
                 # pitcher a team uses is the starter. gamesStarted from the box
                 # score confirms it, so we don't need the opener heuristic here.
                 "role": "SP" if (_num(st.get("gamesStarted")) == 1 or order == 1) else "RP",
+                # Plate-discipline + batted-ball metrics from the play-by-play.
+                # Empty dict (not zeros) when a game has no tracked plays, so
+                # the UI shows em dashes rather than a fake 0.0%.
+                **(metrics.get(int(pid)) or {}),
             })
     return rows
 
@@ -502,6 +644,73 @@ def _fetch_person_info(pitcher_id):
     except Exception as e:
         print(f"[BoxLevels] people lookup failed for {pitcher_id}: {e}")
     return info
+
+
+_pm_cache = {}  # { game_pk: (timestamp, {pitcher_id: metrics}) }
+
+
+def get_game_pitch_metrics(game_pk, allow_fetch=True):
+    """{pitcher_id: pitch metrics} for one game, cached small in Redis.
+
+    Separate from _rows_for_game so a player-page game log — which knows only
+    game_pks, not the schedule rows — can enrich itself. `allow_fetch=False`
+    serves cache-only, for callers that must not pay a cold feed pull.
+    """
+    game_pk = int(game_pk)
+    now = time.time()
+    hit = _pm_cache.get(game_pk)
+    if hit and (now - hit[0]) < _BOX_TTL_FINAL:
+        return hit[1]
+    key = f"{_MILB_CACHE_PREFIX}:pm:{game_pk}"
+    cached = _l2_get(key)
+    if cached is not None:
+        # Redis JSON keys are strings; restore int keys for caller lookups.
+        restored = {int(k): v for k, v in cached.items()}
+        _pm_cache[game_pk] = (now, restored)
+        return restored
+    if not allow_fetch:
+        return {}
+    feed = _fetch_feed(game_pk)
+    if not feed:
+        return {}
+    metrics = _derive_pitch_metrics(feed)
+    if metrics:
+        _pm_cache[game_pk] = (now, metrics)
+        _l2_set(key, {str(k): v for k, v in metrics.items()}, _BOX_TTL_FINAL)
+    return metrics
+
+
+def enrich_log_with_pitch_metrics(rows, pitcher_id, deadline=None, max_fetch=25):
+    """Attach per-game pitch metrics to a pitcher's non-Statcast game-log rows.
+
+    AAA rows are skipped — the Savant merge already gives them richer versions
+    of these same columns, and overwriting would replace per-pitch-accurate
+    values with feed-derived ones.
+
+    Bounded by `max_fetch` and an optional deadline: a cold 20-game log would
+    otherwise pull 20 live feeds (1-3 MB each) on one page load. Cached games
+    are always used; uncached ones beyond the budget simply stay blank and get
+    filled by the daily cron.
+    """
+    targets = [r for r in rows if r.get("level") not in ("AAA", "AFL") and r.get("game_pk")]
+    if not targets:
+        return rows
+    fetched = 0
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {}
+        for r in targets:
+            over_budget = fetched >= max_fetch or (deadline is not None and time.time() >= deadline)
+            futures[pool.submit(get_game_pitch_metrics, r["game_pk"], not over_budget)] = r
+            fetched += 1
+        for f in as_completed(futures):
+            r = futures[f]
+            try:
+                m = (f.result() or {}).get(int(pitcher_id))
+            except Exception:
+                m = None
+            if m:
+                r.update(m)
+    return rows
 
 
 _DIRECTORY_TTL = 6 * 3600

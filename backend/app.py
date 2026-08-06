@@ -53,6 +53,7 @@ from levels import (
 from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers,
+    enrich_log_with_pitch_metrics, get_game_pitch_metrics,
 )
 from redis_cache import redis_get, redis_set, redis_delete
 
@@ -878,6 +879,13 @@ def _merge_multi_level_game_log(pitcher_id, season_year, savant_log):
     AFL games live inside this same list, tagged AFL — not a separate section.
     """
     base = get_multi_level_game_log(pitcher_id, season_year)
+    if base:
+        # Non-Statcast rows get CSW%/SwStr%/batted-ball rates derived from each
+        # game's play-by-play. Bounded so a cold log doesn't pull 20 feeds.
+        try:
+            base = enrich_log_with_pitch_metrics(base, pitcher_id, deadline=time.time() + 20)
+        except Exception as e:
+            print(f"[PlayerPage] pitch-metric enrich failed for {pitcher_id}: {e}")
     if not base:
         # No box-score log at all (very early season, API hiccup) — fall back to
         # whatever Savant gave us rather than showing an empty page.
@@ -1726,6 +1734,9 @@ def cron_warmup_daily(request: Request, response: Response):
                     pr_result = aggregate_pitcher_results(default_date, None, level=code)
                     set_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}", pr_result)
                 else:
+                    # get_level_results pulls each game's live feed once and
+                    # derives the pitch metrics, so this also warms the
+                    # per-game metric cache that player-page logs read.
                     rows = get_level_results(default_date, code)
                     if rows:
                         set_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}_{default_date}", rows)

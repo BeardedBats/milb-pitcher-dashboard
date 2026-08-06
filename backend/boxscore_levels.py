@@ -109,9 +109,14 @@ _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 # bumping only CARD_SCHEMA_VERSION is not enough — the daily key misses,
 # recomputes, and then reads month-old rows straight back out of this cache.
 # That is exactly what shipped v45's metrics to a v46 deploy.
-#   1: initial derived rows (whiffs, CSW%, SwStr%, GB/FB/LD, Hard%)
-#   2: five metric families + per-hand splits
-_METRICS_VERSION = 2
+#   2: initial derived rows (whiffs, CSW%, SwStr%, GB/FB/LD, Hard%) — shipped
+#      as a hand-written literal "rows:v2", which is why numbering starts here
+#   3: five metric families + per-hand splits
+#
+# Note the near-miss: replacing the literal with a constant set to 2 produced a
+# byte-identical key and kept serving the very rows the bump was meant to
+# retire. A version bump is only real if the resulting key string changes.
+_METRICS_VERSION = 3
 
 
 def _l2_get(key):

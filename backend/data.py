@@ -1614,6 +1614,9 @@ def _persist_range_day_snapshot(date_str, df):
     payload = _compress_records(records) if records else []
     redis_set(_range_day_key(date_str), payload, ttl=RANGE_DAY_TTL)
     redis_sadd(f"{CACHE_INDEX_PREFIX}:date:{date_str}", _range_day_key(date_str), ttl=CACHE_INDEX_TTL)
+    # Membership marker so missing_range_days can answer "is this day baked?"
+    # with one SMEMBERS instead of loading every snapshot.
+    _mark_range_day_baked(date_str)
 
 
 def _date_strings(start_date, end_date):
@@ -1817,15 +1820,34 @@ def fetch_date_range_materialized(start_date, end_date):
     return _merge_daily_cache(persisted, start_date, end_date)
 
 
+# Membership set of days that have a baked range_day snapshot.
+#
+# Existence has to be answered WITHOUT loading the snapshots: a season is ~110
+# days of compressed Statcast, and pulling them just to ask "is this present?"
+# is both slow and the exact memory profile that was OOM-killing the cron.
+# One SMEMBERS answers it instead.
+def _baked_days_key():
+    return f"{RANGE_DAY_PREFIX}:baked:lvl{STATCAST_SCOPE}:s{CARD_SCHEMA_VERSION}"
+
+
+def _mark_range_day_baked(date_str):
+    try:
+        redis_sadd(_baked_days_key(), date_str, ttl=RANGE_DAY_TTL)
+    except Exception:
+        pass
+
+
 def missing_range_days(start_date, end_date):
     """Days in the window with no persisted range_day snapshot yet."""
-    missing = []
-    for day in _date_strings(start_date, end_date):
-        if _is_today(day):
-            continue  # today is fetched live, never baked
-        if _load_range_day(day) is _MISSING_RANGE_DAY:
-            missing.append(day)
-    return missing
+    try:
+        baked = set(redis_smembers(_baked_days_key()) or [])
+    except Exception:
+        baked = set()
+    return [
+        day for day in _date_strings(start_date, end_date)
+        # Today is fetched live and never baked, so it is never "missing".
+        if not _is_today(day) and day not in baked
+    ]
 
 
 # How many days one cron invocation will bake. A full season is ~134 days and

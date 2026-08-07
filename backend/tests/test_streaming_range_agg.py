@@ -166,6 +166,40 @@ def test_rates_are_derived_from_totals_not_averaged(days):
             assert row[k] == pytest.approx(want[k], rel=1e-9, abs=1e-9), k
 
 
+def test_null_group_keys_are_dropped_identically_by_both_paths():
+    """Production has pitches with no pitch_type, and pandas groupby drops rows
+    with a NaN key. That makes per-pitcher usage sum to less than 100% (observed
+    on WOR: one pitcher at 95.8%), because pitcher_totals groups by pitcher only
+    while the rows group by pitch_type too.
+
+    That is pre-existing behaviour, not something the split introduced — but it
+    is only pre-existing if BOTH paths drop the same rows. That is what this
+    pins down.
+    """
+    a = _make_day("2026-06-01", 21, n=200)
+    b = _make_day("2026-06-02", 22, n=200)
+    # Null out pitch identity on a slice of each day, spanning both days for the
+    # same pitcher so any per-day-vs-whole-range divergence would show up.
+    for frame in (a, b):
+        idx = frame.index[frame["pitcher"] == 101][:12]
+        frame.loc[idx, "pitch_type"] = None
+        frame.loc[idx, "pitch_name"] = None
+
+    whole = A.aggregate_pitch_data_range(pd.concat([a, b], ignore_index=True))
+
+    acc = A.new_pitch_data_accumulator()
+    for day in (a, b):
+        A.accumulate_pitch_data(acc, day)
+    streamed = A.finalize_pitch_data(acc)
+
+    assert streamed == whole
+
+    # And confirm the fixture actually reproduces the <100% usage, so this test
+    # keeps meaning something if the upstream data ever changes.
+    total_usage = sum(r["usage"] for r in whole if r["pitcher_id"] == 101)
+    assert total_usage < 99.5, f"expected dropped rows to depress usage, got {total_usage}"
+
+
 def test_empty_and_absent_days_are_harmless(days):
     acc = A.new_pitch_data_accumulator()
     A.accumulate_pitch_data(acc, pd.DataFrame())

@@ -12,6 +12,7 @@ import { fetchPlayerPageResource, fetchWarmupStatus } from "../utils/api";
 import { buildCardHash } from "../utils/navigation";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
 import WarmupStalled from "./WarmupStalled";
+import LoadError from "./LoadError";
 import usePitchFilters from "../hooks/usePitchFilters";
 import VelocityChart from "./VelocityChart";
 import RegularSeasonTable from "./RegularSeasonTable";
@@ -19,7 +20,7 @@ import RegularSeasonTable from "./RegularSeasonTable";
 export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
   const isMobile = useIsMobile();
   const buildCardHref = (gameDate, gamePk) => `#${buildCardHash({ date: gameDate, pitcherId, gamePk })}`;
-  const { data, loading, message: loadMsg, stalled, reload } = useWarmupBackedResource({
+  const { data, loading, message: loadMsg, error, stalled, reload } = useWarmupBackedResource({
     key: [pitcherId],
     load: () => fetchPlayerPageResource(pitcherId, { startDate: "2026-03-25" }),
     pollWarmup: fetchWarmupStatus,
@@ -190,6 +191,18 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
     if (pbpDisabled || !pbpGamePk || !pbpGameDate) return;
     onGameClick(pbpGameDate, pitcherId, pbpGamePk);
   };
+
+  // Before the "Player not found" branch below — a failed request is not a
+  // missing player, and conflating them hides outages behind a plausible
+  // "no such pitcher".
+  if (error) {
+    return (
+      <div className="pp-outer-centered">
+        <a className="back-btn" href={window.location.pathname} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); onBack(); } }} style={{ textDecoration: "none" }}>← Back</a>
+        <LoadError message="Couldn't load this player." detail={error.message} onRetry={reload} />
+      </div>
+    );
+  }
 
   if (stalled) {
     // Retry budget spent — polling has stopped. Unlike the loading branch the

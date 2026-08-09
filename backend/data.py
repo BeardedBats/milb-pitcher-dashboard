@@ -30,6 +30,10 @@ from levels import (
 # at once, so its scope token names the whole set.
 STATCAST_SCOPE = "-".join(STATCAST_LEVELS)
 
+# Mirrors app._IS_SERVERLESS. Duplicated rather than imported because app
+# imports data, not the other way round.
+_IS_SERVERLESS = os.environ.get("VERCEL") == "1" or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
+
 _cache = {}          # { date_str: (timestamp, dataframe) }
 _season_cache = {}   # { (pitcher_id, season_year): (timestamp, dataframe) }
 _batter_name_cache = {}  # { batter_id: "Full Name" }
@@ -1771,7 +1775,7 @@ def _merge_daily_cache_for_day(day_df, date_str):
 RANGE_STREAM_LOOKAHEAD = 8
 
 
-def fold_range_materialized(start_date, end_date, fold):
+def fold_range_materialized(start_date, end_date, fold, skip_missing=False):
     """Stream a materialized range through `fold`, one day at a time.
 
     The memory-safe counterpart to fetch_date_range_materialized: same day set,
@@ -1782,15 +1786,22 @@ def fold_range_materialized(start_date, end_date, fold):
     `fold(day_df)` is called once per day that has rows, in date order. Returns
     True when the range was complete, False when a day is not yet materialized
     (the caller should answer 202).
+
+    `skip_missing=True` switches to best-effort: unmaterialized days are skipped
+    instead of aborting, and the return is always True. That is the contract the
+    pitcher directory's partial fallback wants — a roster assembled from
+    whatever days exist beats no roster at all — and it must NOT be used by
+    callers whose numbers would be silently wrong with days missing.
     """
     persisted_end = _previous_date(end_date) if _is_today(end_date) else end_date
 
     if persisted_end >= start_date:
         # Same cheap pre-check as _load_persisted_range: one SMEMBERS, and a
         # single confirming GET because the marker set can under-report.
-        probably_missing = missing_range_days(start_date, persisted_end)
-        if probably_missing and _load_range_day(probably_missing[0]) is None:
-            return False
+        if not skip_missing:
+            probably_missing = missing_range_days(start_date, persisted_end)
+            if probably_missing and _load_range_day(probably_missing[0]) is None:
+                return False
 
         date_list = list(_date_strings(start_date, persisted_end))
         pool = ThreadPoolExecutor(max_workers=RANGE_STREAM_LOOKAHEAD)
@@ -1803,6 +1814,8 @@ def fold_range_materialized(start_date, end_date, fold):
                     pending[ahead] = pool.submit(_load_range_day, ahead)
                 day = pending.pop(date_str).result()
                 if day is None:
+                    if skip_missing:
+                        continue
                     return False  # not materialized — caller 202s
                 day = _merge_daily_cache_for_day(day, date_str)
                 if day is not None and not day.empty:
@@ -2259,6 +2272,97 @@ def build_pitchers_list_from_df(df):
     return result
 
 
+# ── Streaming pitcher-directory aggregation ──
+#
+# build_pitchers_list_from_df needs the whole range as one frame. Across a
+# season that is ~612k pitch rows / ~1.3 GB, and it is what OOM-killed
+# /api/pitchers-directory (and, via the background rebuild thread, whatever
+# unrelated request happened to share the warm instance). These three fold the
+# same groupby one day at a time, so peak memory is one day.
+#
+# The aggregation is foldable because every field is either order-independent
+# or a running extreme: first-non-null name/hand, unique team list, summed
+# pitch count, max game_date. Days are folded in date order, so "first" means
+# what it means in the whole-frame groupby. Equivalence is pinned by
+# backend/tests/test_pitchers_directory_stream.py — keep that test green.
+
+def _is_nullish(v):
+    """pd.isna, but safe on the list/array values a groupby can hand back."""
+    try:
+        return v is None or bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def new_pitchers_list_accumulator():
+    return {}
+
+
+def accumulate_pitchers_list(acc, day_df):
+    """Fold one day's pitch frame into a pitcher-directory accumulator."""
+    if day_df is None or day_df.empty or "pitcher" not in day_df.columns:
+        return
+    spec = {}
+    if "player_name" in day_df.columns:
+        spec["player_name"] = "first"          # pandas "first" = first NON-NULL
+    if "pitcher_team" in day_df.columns:
+        spec["pitcher_team"] = lambda x: list(pd.unique(x))
+    if "p_throws" in day_df.columns:
+        spec["p_throws"] = "first"
+    if "game_date" in day_df.columns:
+        spec["game_date"] = "max"
+
+    grouped = day_df.groupby("pitcher")
+    sizes = grouped.size()
+    day_agg = grouped.agg(spec) if spec else None
+
+    for pid, n in sizes.items():
+        entry = acc.get(pid)
+        if entry is None:
+            entry = {"name": None, "teams": [], "hand": None,
+                     "pitches": 0, "last_date": None}
+            acc[pid] = entry
+        # Pitch count is a plain sum — the one field that would be wrong if a
+        # day were folded twice, which is why the fold is strictly date-ordered.
+        entry["pitches"] += int(n)
+        if day_agg is None:
+            continue
+        row = day_agg.loc[pid]
+
+        name = row.get("player_name")
+        if entry["name"] is None and not _is_nullish(name):
+            entry["name"] = name
+        hand = row.get("p_throws")
+        if entry["hand"] is None and not _is_nullish(hand):
+            entry["hand"] = hand
+        teams = row.get("pitcher_team")
+        if isinstance(teams, list):
+            for t in teams:
+                if t not in entry["teams"]:
+                    entry["teams"].append(t)
+        game_date = row.get("game_date")
+        if not _is_nullish(game_date):
+            game_date = str(game_date)
+            if entry["last_date"] is None or game_date > entry["last_date"]:
+                entry["last_date"] = game_date
+
+
+def finalize_pitchers_list(acc):
+    result = [{
+        "pitcher_id": int(pid),
+        "name": entry["name"],
+        # Precomputed accent-stripped lowercase name — see _name_search_norm.
+        "name_norm": _name_search_norm(entry["name"]),
+        "teams": list(entry["teams"]),
+        "hand": entry["hand"],
+        # Ranking signals consumed by the search UI (see SearchBar.jsx).
+        "pitches": int(entry["pitches"]),
+        "last_date": str(entry["last_date"])[:10] if entry["last_date"] is not None else None,
+    } for pid, entry in acc.items()]
+    result.sort(key=lambda r: r["name"] or "")
+    return result
+
+
 def _pitcher_dir_key(start_date, end_date):
     return f"pitcher_dir:{start_date}_{end_date}"
 
@@ -2291,10 +2395,15 @@ def fetch_all_pitchers_list_materialized(start_date, end_date):
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
         return redis_val
-    df = fetch_date_range_materialized(start_date, end_date)
-    if df is None:
+    # Streamed a day at a time — see the accumulator above. This used to call
+    # fetch_date_range_materialized and hand a whole-season frame to
+    # build_pitchers_list_from_df, which is the allocation that OOM-killed the
+    # directory endpoints.
+    acc = new_pitchers_list_accumulator()
+    if not fold_range_materialized(start_date, end_date,
+                                   lambda day_df: accumulate_pitchers_list(acc, day_df)):
         return None
-    result = build_pitchers_list_from_df(df)
+    result = finalize_pitchers_list(acc)
     _pitchers_list_cache[cache_key] = (time.time(), result)
     # Long TTL — a pitcher roster is mostly stable across the season. The
     # daily/live warmup crons explicitly refresh this so debut pitchers
@@ -2315,6 +2424,21 @@ _pitcher_dir_build_lock = threading.Lock()
 
 
 def _background_build_pitcher_directory(start_date, end_date):
+    """Refresh the directory keys off the request path. LOCAL ONLY.
+
+    On Vercel a function is frozen the instant its response is sent, so this
+    thread does not get to finish: it resumes inside whatever later invocation
+    reuses the instance and allocates there, against that request's memory.
+    That is how a directory rebuild OOM-killed /api/initial-load and
+    /api/pitchers-search — endpoints that never touch the directory at all.
+    It is the same reason range materialization is a cron and not a thread.
+
+    The warmup-daily cron calls fetch_all_pitchers_list_materialized and
+    persists both directory keys, so on serverless the rebuild is already
+    covered; the request path serves the partial list until the cron lands.
+    """
+    if _IS_SERVERLESS:
+        return
     key = (start_date, end_date)
     with _pitcher_dir_build_lock:
         if key in _pitcher_dir_building:
@@ -2381,30 +2505,25 @@ def fetch_pitchers_list_partial(start_date, end_date):
     day in the window to be present — missing days are silently skipped.
     Used as a fallback for the search endpoint so users still get results
     when the canonical materialized range has a transient gap.
+
+    Folded a day at a time (skip_missing=True). The previous version collected
+    every day's frame and pd.concat'd them, which on a full season is the same
+    ~1.3 GB object the rest of this module exists to avoid — and this is the
+    COLD-MISS path, i.e. exactly the request least able to afford it.
+
+    Sharing the fold also widened the day set slightly: it now picks up the
+    daily cache and today's live day, which the old snapshot-only loop skipped.
+    That is a superset (a debut pitcher is searchable the same day rather than
+    after the next cron), and it makes the partial and strict directories agree
+    on which days exist.
     """
-    # Per-key GETs — see comment in _load_persisted_range. MGET trips
-    # Upstash's response size cap on regular-season days.
-    frames = []
-    for date_str in _date_strings(start_date, end_date):
-        try:
-            stored = redis_get(_range_day_key(date_str))
-            records = _decompress_records(stored)
-        except Exception:
-            continue
-        if records:
-            try:
-                frames.append(_records_to_df(records))
-            except Exception:
-                continue
-    if not frames:
-        return []
-    try:
-        df = pd.concat(frames, ignore_index=True)
-    except Exception:
-        return []
-    if df.empty or "pitcher" not in df.columns:
-        return []
-    return build_pitchers_list_from_df(df)
+    acc = new_pitchers_list_accumulator()
+    fold_range_materialized(
+        start_date, end_date,
+        lambda day_df: accumulate_pitchers_list(acc, day_df),
+        skip_missing=True,
+    )
+    return finalize_pitchers_list(acc)
 
 
 # ── Startup warmup ──

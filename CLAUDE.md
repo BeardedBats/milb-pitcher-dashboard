@@ -82,6 +82,20 @@ A season is ~612k pitch rows. As a single DataFrame that is on the order of **1.
 - Two rules make the split valid, and both are easy to break: **rates must be derived in `finalize` from merged totals** (averaging per-day percentages is wrong), and **means carry a `(sum, non-NaN count)` pair**, never a mean. Game-scoped work (games played, SP/RP role, boxscore ER/IP) is safe per day only because a `game_pk` belongs to exactly one `game_date`.
 - `_load_persisted_range` still builds a whole-range frame for the remaining callers (`/api/pitcher-season-totals` fallback, `warmup-daily-2`). It pre-checks `missing_range_days` (one SMEMBERS) and bails on the first missing day, because this path runs on **every 202** via `_loading_response` → `queue_range_materialization`. The marker set can UNDER-report (it postdates the snapshots), so a "missing" verdict is confirmed with one real GET before being trusted — otherwise a stale marker fakes an unmaterialized range and triggers a needless re-bake.
 
+### Routing — one path route, everything else is a hash
+`frontend/src/utils/navigation.js` owns the shape. Hash routes (`#card/...`, `#player/...`, `#team/...`) hang off the home path; `/rehab` is the ONE path route, so the Rehab page can be linked and shared.
+- **`vercel.json` must rewrite a path route to `/index.html`** or it 404s in production — the static output has no SPA fallback. `/rehab/` redirects to `/rehab`: the CRA build sets `homepage: "."`, so assets resolve relative to the URL and a trailing slash would look for them under `/rehab/static/…`.
+- Build hash URLs and "back home" targets from **`homePath()`**, never `window.location.pathname`. A link built while on `/rehab` would otherwise become `/rehab#player/123` and reload as the Rehab view.
+- `page` state is `"games" | "team" | "player" | "rehab"`, and every pushed history entry stamps it so Back lands on the view the tab was opened at. Landing on `/rehab` skips the mount slate fetch entirely (`date` stays null until the user navigates home).
+
+### Rehab page (`/rehab`, `/api/rehab-starts`)
+MLB pitchers on an IL who have made a minor-league start in the last 14 days — a cross-level question, so it ignores the level, org and date filters.
+- The gameLog rows the endpoint assembles carry no pitch-level rates. SwStr%/CSW%/velocity come from the start's play-by-play feed via `get_game_pitch_metrics`, and **only the latest start per pitcher is enriched** — that is the one row rendered, so this costs one feed per rehabbing pitcher, not one per start. Bounded by `_REHAB_ENRICH_BUDGET_S`; past it, rows serve cache-only and their rate columns stay blank until the next rebuild (per-game metrics cache 30 days).
+- `avg_velo` is gated on `STATCAST_LEVELS`, so a stray reading in a lower-level feed can never print as a real average.
+
+### MLB-experience green
+`.mlb-exp` marks pitchers with big-league service in every table. The color rule is gated on **`.mlb-exp-on` at the app root**, toggled by the persisted MLB Green checkbox — rows keep the class either way, only the color comes and goes.
+
 ### Frontend Utilities
 - `frontend/src/utils/pitchFilters.js` — `getTooltipResult(pitch, opts)` shared tooltip utility returning `{ label, color, isK, isCalledStrikeThree, subLabel }`. Normalizes both Statcast and PBP formats.
 - `frontend/src/utils/pollBackoff.js` — `nextRetryDelay`, `parseRetryAfter`, `jitter` + the retry constants. See the 202 contract above.

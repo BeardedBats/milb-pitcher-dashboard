@@ -9,7 +9,7 @@ import PlayByPlayModal from "./components/PlayByPlayModal";
 import ReclassifyModal from "./components/ReclassifyModal";
 import SearchBar from "./components/SearchBar";
 import AdaptedResultsTable, { ADAPTED_COLUMNS, ADAPTED_DEFAULT_HIDDEN } from "./components/AdaptedResultsTable";
-import RehabStartsTable from "./components/RehabStartsTable";
+import RehabStartsTable, { REHAB_COLUMNS, REHAB_DEFAULT_HIDDEN } from "./components/RehabStartsTable";
 import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, fetchRehabStarts, DEFAULT_LEVEL } from "./utils/api";
 import { PITCH_TYPE_FILTERS, PITCH_COLORS, TEAM_FULL_NAMES, PITCHER_RESULTS_COLUMNS } from "./constants";
 import usePersistentState from "./hooks/usePersistentState";
@@ -25,6 +25,9 @@ import {
   openHashInNewWindow,
   openHashesInNewTabs,
   scrollToTopAfterRender,
+  homePath,
+  isRehabPath,
+  REHAB_PATH,
 } from "./utils/navigation";
 
 // Columns dropdown sections for the adapted (non-Statcast) table.
@@ -70,6 +73,9 @@ function isLiveGame(game) {
 export default function App() {
   const isMobile = useIsMobile();
   const startsOnHashRoute = React.useRef(getHashParts(window.location.hash).length > 0);
+  // /rehab is a real, shareable URL. A hash route still wins — the hash is the
+  // more specific destination and /rehab#player/123 must open the player.
+  const startsOnRehab = React.useRef(isRehabPath() && !startsOnHashRoute.current);
   const [date, setDate] = useState(null);
   const [games, setGames] = useState([]);
   const [selectedGame, setSelectedGame] = useState(null);
@@ -92,13 +98,21 @@ export default function App() {
   const [level, setLevel] = usePersistentState("pl_milb_level", DEFAULT_LEVEL);
   const [orgFilter, setOrgFilter] = usePersistentState("pl_milb_org", "");
   const [levelMeta, setLevelMeta] = useState(null);
-  // Rehab SP is a cross-level view (MLB arms on the IL rehabbing anywhere in
-  // the minors), so it ignores the level/org filters entirely.
-  const [rehabMode, setRehabMode] = useState(false);
+  // Rehab is a cross-level PAGE (MLB arms on the IL rehabbing anywhere in the
+  // minors), so it ignores the level/org filters and the selected date
+  // entirely. It lives at /rehab; see utils/navigation.
   const [rehabData, setRehabData] = useState(null);
   const [rehabLoading, setRehabLoading] = useState(false);
+  const [rehabError, setRehabError] = useState(null);
   const [rehabSortKey, setRehabSortKey] = useState("date");
   const [rehabSortDir, setRehabSortDir] = useState("desc");
+  const [rehabHiddenCols, setRehabHiddenCols] = usePersistentState(
+    "pl_milb_rehab_hidden", REHAB_DEFAULT_HIDDEN);
+  const [showRehabColFilter, setShowRehabColFilter] = useState(false);
+  // Green names for pitchers with big-league service. Persisted and applied via
+  // a root class so every table (games, team, player, rehab) follows one
+  // switch — see `.mlb-exp-on` in styles.css.
+  const [mlbGreen, setMlbGreen] = usePersistentState("pl_milb_mlb_green", true);
   const [pitchFilter, setPitchFilter] = useState("Four-Seamer");
   const [resultsHiddenCols, setResultsHiddenCols] = useState(["team", "hand"]);
   // The adapted table has far more columns than the Statcast one (five metric
@@ -112,7 +126,7 @@ export default function App() {
   const tabsHintTimer = React.useRef(null);
   const [pbpModal, setPbpModal] = useState(null); // { inning, isTop } or null
   const [reclassifyPitch_, setReclassifyPitch] = useState(null); // pitch object to reclassify
-  const [page, setPage] = useState("games"); // "games" | "team" | "player"
+  const [page, setPage] = useState(() => (startsOnRehab.current ? "rehab" : "games")); // "games" | "team" | "player" | "rehab"
   const [playerPageId, setPlayerPageId] = useState(null);
   const [selectedTeamPage, setSelectedTeamPage] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -155,6 +169,9 @@ export default function App() {
   useEffect(() => {
     const hashParts = getHashParts(window.location.hash);
     if (hashParts.length > 0) return; // Deep-link will handle its own loading
+    // Landing on /rehab needs none of the slate: the Rehab view is its own
+    // endpoint. resetToDefault() fetches the slate if the user navigates home.
+    if (startsOnRehab.current) return;
     setLoading(true);
     fetchInitialLoad(level)
       .then(data => {
@@ -184,14 +201,17 @@ export default function App() {
   // "Finding rehab starts...".
   const rehabInFlight = React.useRef(false);
   useEffect(() => {
-    if (!rehabMode || rehabData || rehabInFlight.current) return;
+    if (page !== "rehab" || rehabData || rehabInFlight.current) return;
     rehabInFlight.current = true;
     setRehabLoading(true);
+    setRehabError(null);
     fetchRehabStarts(14)
       .then(d => { setRehabData(d); })
-      .catch(() => { setRehabData({ pitchers: [] }); })
+      // A failure must not fall through to the table's empty state — "nobody is
+      // rehabbing" and "the request died" are different answers.
+      .catch(() => { setRehabError("Failed to load rehab starts."); })
       .finally(() => { rehabInFlight.current = false; setRehabLoading(false); });
-  }, [rehabMode, rehabData]);
+  }, [page, rehabData]);
 
   // Level + org dropdown options (static per season).
   useEffect(() => {
@@ -325,7 +345,10 @@ export default function App() {
     const parts = getHashParts(window.location.hash);
     if (parts.length === 0) { hashHandled.current = true; return; }
     hashHandled.current = true;
-    const baseHash = window.location.pathname;
+    // Home entry pushed behind the deep-linked route. homePath(), not the raw
+    // pathname: a /rehab#player/123 link must leave Back pointing at the games
+    // page, not at the Rehab view.
+    const baseHash = homePath();
     const route = parseBaseballHash(window.location.hash);
     if (route.type === "player") {
       const pid = route.pitcherId;
@@ -371,7 +394,7 @@ export default function App() {
     setPage("games");
     setPlayerPageId(null);
     setSelectedTeamPage(null);
-    window.history.pushState({ view: "list", page: "games", selectedGame: null }, "", window.location.pathname);
+    window.history.pushState({ view: "list", page: "games", selectedGame: null }, "", homePath());
     // Deep-linking to #player/#team skips the mount initial-load entirely, so
     // `date` is still null here — without this fetch the home page rendered
     // the empty "No games found" state with nothing in flight.
@@ -399,9 +422,11 @@ export default function App() {
 
   // Browser back/forward navigation support
   useEffect(() => {
-    // Set initial state only if not deep-linking via hash
+    // Set initial state only if not deep-linking via hash. The page is stamped
+    // so Back out of a card lands on whichever view the tab was opened at.
     if (!window.location.hash) {
-      window.history.replaceState({ view: "list", selectedGame: null }, "");
+      window.history.replaceState(
+        { view: "list", page: startsOnRehab.current ? "rehab" : "games", selectedGame: null }, "");
     }
   }, []);
 
@@ -418,7 +443,11 @@ export default function App() {
     } else if (state.page === "team" && state.team) {
       hash = `#${buildTeamHash(state.team)}`;
     }
-    window.history.pushState(state, title, hash || window.location.pathname);
+    // A hash route always hangs off the home path — otherwise navigating from
+    // /rehab to a player would produce /rehab#player/123, which reloads as the
+    // Rehab view's URL. Rehab itself is the one state with a path of its own.
+    const path = state.page === "rehab" ? REHAB_PATH : homePath();
+    window.history.pushState(state, title, hash ? `${homePath()}${hash}` : path);
   }, []);
 
   useEffect(() => {
@@ -431,6 +460,7 @@ export default function App() {
         setSelectedGame(state?.selectedGame || null);
         if (state?.page === "team") { setPage("team"); setSelectedTeamPage(state.team); }
         else if (state?.page === "player") { setPage("player"); setPlayerPageId(state.pitcherId); }
+        else if (state?.page === "rehab") { setPage("rehab"); }
         else { setPage("games"); }
       } else if (state.view === "game") {
         setPendingCard(null);
@@ -784,6 +814,24 @@ export default function App() {
     }).catch(e => { setPendingCard(null); setError(e.message); setLoading(false); skipDateFetchForCard.current = false; });
   };
 
+  const navigateToRehab = (e) => {
+    // Ctrl/Cmd/middle-click: let the real anchor open /rehab in a new tab.
+    if (isNewWindowClick(e)) return;
+    if (e && e.preventDefault) e.preventDefault();
+    const curState = window.history.state;
+    if (curState) {
+      window.history.replaceState({ ...curState, scrollY: window.scrollY }, "");
+    }
+    window.scrollTo(0, 0);
+    setPendingCard(null);
+    setCardData(null);
+    setSelectedGame(null);
+    setPlayerPageId(null);
+    setSelectedTeamPage(null);
+    setPage("rehab");
+    pushState({ view: "list", page: "rehab", selectedGame: null }, "");
+  };
+
   const navigateBackToGames = () => {
     setPage("games");
     setPendingCard(null);
@@ -817,17 +865,32 @@ export default function App() {
         ))}
       </select>
       <div className="header-nav-spacer" />
+      {/* Cross-level view: MLB arms on an IL rehabbing anywhere in the system.
+          A real anchor, so it can be middle-clicked, copied and shared. */}
+      <a
+        className={`nav-link-btn${page === "rehab" ? " active" : ""}`}
+        href={REHAB_PATH}
+        rel="nofollow"
+        onClick={navigateToRehab}
+        title="MLB pitchers on the IL who have made a minor-league start in the last two weeks"
+      >
+        Rehab
+      </a>
       <SearchBar onSelectPlayer={(id, name, e) => navigateToPlayer(id, name, e)} />
     </div>
   );
 
   return (
-    <div className="app">
+    // One switch for the big-league-experience highlight, applied at the root
+    // so every table below it follows without threading a prop through each.
+    <div className={mlbGreen ? "app mlb-exp-on" : "app"}>
       {/* === HEADER (always shown when no card view) === */}
       {!cardData && (
         <div className="header">
-          <h1 className="app-title"><a href={window.location.pathname} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey && e.button !== 1) { e.preventDefault(); resetToDefault(); } }} style={{ color: "inherit", textDecoration: "none" }}>MiLB Pitch Dashboard</a></h1>
-          <DatePicker date={date} onChange={setDate} />
+          <h1 className="app-title"><a href={homePath()} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey && e.button !== 1) { e.preventDefault(); resetToDefault(); } }} style={{ color: "inherit", textDecoration: "none" }}>MiLB Pitch Dashboard</a></h1>
+          {/* Rehab answers a fixed two-week window, so a date picker there would
+              be a control that does nothing. */}
+          {page !== "rehab" && <DatePicker date={date} onChange={setDate} />}
           {headerNav}
         </div>
       )}
@@ -851,6 +914,71 @@ export default function App() {
         <Suspense fallback={<div className="loading"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div></div>}>
           <PlayerPage key={playerPageId} pitcherId={playerPageId} onBack={navigateBackToGames} onGameClick={navigateToGameCard} />
         </Suspense>
+      )}
+
+      {/* === REHAB PAGE (/rehab) === */}
+      {page === "rehab" && !cardData && (
+        <div className="main-table-area">
+          <div className="controls-row">
+            <div className="rehab-title">
+              Rehab Starts
+              {rehabData?.start_date ? <span className="rehab-subtitle">since {rehabData.start_date}</span> : null}
+            </div>
+            <div className="toggle-group">
+              <label className="toggle-label" title="Show pitchers with major-league experience in green">
+                <input type="checkbox" checked={mlbGreen} onChange={e => setMlbGreen(e.target.checked)} />
+                <span>MLB Green</span>
+              </label>
+              <div className="col-filter-inline">
+                <button className="col-filter-toggle" onClick={() => setShowRehabColFilter(v => !v)}>
+                  Columns {showRehabColFilter ? "▲" : "▼"}
+                </button>
+                {showRehabColFilter && (
+                  <div className="col-filter-dropdown">
+                    {REHAB_COLUMNS.filter(c => c.key !== "date" && c.key !== "pitcher").map(c => (
+                      <label key={c.key} className="col-filter-label" title={c.title || undefined}>
+                        <input
+                          type="checkbox"
+                          checked={!rehabHiddenCols.includes(c.key)}
+                          onChange={() => setRehabHiddenCols(prev => prev.includes(c.key)
+                            ? prev.filter(k => k !== c.key)
+                            : [...prev, c.key])}
+                        />
+                        {c.label}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="table-card">
+            <div className="table-container">
+              {rehabLoading
+                ? <div className="loading-msg"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div>Finding rehab starts across all levels...</div>
+                : rehabError
+                ? <div className="rehab-empty">
+                    {rehabError}{" "}
+                    <button
+                      type="button"
+                      className="col-filter-toggle"
+                      onClick={() => { setRehabError(null); setRehabData(null); }}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                : <RehabStartsTable
+                    data={rehabData}
+                    onPitcherClick={(id, e) => navigateToPlayer(id, null, e)}
+                    hiddenCols={rehabHiddenCols}
+                    sortKey={rehabSortKey}
+                    onSortKeyChange={setRehabSortKey}
+                    sortDir={rehabSortDir}
+                    onSortDirChange={setRehabSortDir}
+                  />}
+            </div>
+          </div>
+        </div>
       )}
 
       {/* === GAMES PAGE (original daily view) === */}
@@ -925,15 +1053,10 @@ export default function App() {
                     <input type="checkbox" checked={splitByTeam} onChange={e => setSplitByTeam(e.target.checked)} />
                     <span>By Team</span>
                   </label>
-                  {/* Cross-level view: MLB arms on an IL rehabbing anywhere in
-                      the system. Ignores the level and org filters. */}
-                  <button
-                    className={`view-btn${rehabMode ? " active" : ""}`}
-                    onClick={() => setRehabMode(v => !v)}
-                    title="MLB pitchers on the IL who have made a minor-league start in the last two weeks"
-                  >
-                    Rehab SP
-                  </button>
+                  <label className="toggle-label" title="Show pitchers with major-league experience in green">
+                    <input type="checkbox" checked={mlbGreen} onChange={e => setMlbGreen(e.target.checked)} />
+                    <span>MLB Green</span>
+                  </label>
                   {view === "pitcher-results" && (
                     <div className="col-filter-inline">
                       <button className="col-filter-toggle" onClick={() => setShowColFilter(v => !v)}>
@@ -988,8 +1111,11 @@ export default function App() {
         </>
       )}
 
-      {loading && <div className="loading"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div></div>}
-      {error && (
+      {/* The Rehab page has its own loader and its own failure text — a slate
+          fetch still in flight (or already failed) behind it must not paint a
+          spinner or an error banner over it. */}
+      {loading && page !== "rehab" && <div className="loading"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div></div>}
+      {error && page !== "rehab" && (
         <div className="error" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
           <div>{error}</div>
           <button
@@ -1015,28 +1141,14 @@ export default function App() {
         <div className="main-table-area">
           <div className={splitByTeam ? "table-card-none" : "table-card"}>
             <div className="table-container">
-              {/* Rehab SP replaces the slate tables entirely — it is not a
-                  filter on the current date/level, it is its own question. */}
-              {rehabMode && (
-                rehabLoading
-                  ? <div className="loading-msg"><div className="loading-bars"><div className="loading-bar" /><div className="loading-bar" /><div className="loading-bar" /></div>Finding rehab starts across all levels...</div>
-                  : <RehabStartsTable
-                      data={rehabData}
-                      onPitcherClick={(id, e) => navigateToPlayer(id, null, e)}
-                      sortKey={rehabSortKey}
-                      onSortKeyChange={setRehabSortKey}
-                      sortDir={rehabSortDir}
-                      onSortDirChange={setRehabSortDir}
-                    />
-              )}
-              {!rehabMode && view === "pitch-data" && isStatcastLevel && (
+              {view === "pitch-data" && isStatcastLevel && (
                 <PitchDataTable data={filteredPitchData} date={date} onPitcherClick={openCard} splitByTeam={splitByTeam} spOnly={spOnly} isMobile={isMobile} sortKey={pitchSortKey} onSortKeyChange={setPitchSortKey} sortDir={pitchSortDir} onSortDirChange={setPitchSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
-              {!rehabMode && view === "pitcher-results" && isStatcastLevel && (
+              {view === "pitcher-results" && isStatcastLevel && (
                 <PitcherResultsTable data={filteredResultsData} date={date} onPitcherClick={openCard} spOnly={spOnly} splitByTeam={splitByTeam} isMobile={isMobile} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} hiddenCols={resultsHiddenCols} onSortedRowsChange={setCurrentTableRows} />
               )}
               {/* Below AAA the box score is all there is — adapted columns only. */}
-              {!rehabMode && !isStatcastLevel && (
+              {!isStatcastLevel && (
                 <AdaptedResultsTable data={filteredResultsData} level={level} hiddenCols={adaptedHiddenCols} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
             </div>
@@ -1049,7 +1161,7 @@ export default function App() {
             )}
             <a
               className={`create-tabs-btn${!currentTableRows.length ? " create-tabs-btn--disabled" : ""}`}
-              href={window.location.pathname}
+              href={homePath()}
               rel="nofollow"
               role="button"
               aria-disabled={!currentTableRows.length}
@@ -1076,7 +1188,7 @@ export default function App() {
       {!loading && !error && cardData && (
         <>
           <div className="header">
-            <h1 className="app-title"><a href={window.location.pathname} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey && e.button !== 1) { e.preventDefault(); resetToDefault(); } }} style={{ color: "inherit", textDecoration: "none" }}>MiLB Pitch Dashboard</a></h1>
+            <h1 className="app-title"><a href={homePath()} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey && e.button !== 1) { e.preventDefault(); resetToDefault(); } }} style={{ color: "inherit", textDecoration: "none" }}>MiLB Pitch Dashboard</a></h1>
             <DatePicker date={date} onChange={setDate} />
             {headerNav}
           </div>

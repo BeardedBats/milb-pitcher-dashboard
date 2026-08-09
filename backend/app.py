@@ -1386,6 +1386,13 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
     set_agg_cache(agg_key, result)
     return result
 
+# How long the Rehab view may spend pulling live feeds for its pitch metrics.
+# Past it, the remaining rows serve cache-only and their rate columns stay
+# blank rather than the whole page timing out; per-game metrics cache for 30
+# days, so the next rebuild fills in whatever this pass skipped.
+_REHAB_ENRICH_BUDGET_S = 40
+
+
 @app.get("/api/rehab-starts")
 def rehab_starts(response: Response, days: int = Query(14)):
     """MLB pitchers on an injured list who have made a minor-league START recently.
@@ -1437,6 +1444,36 @@ def rehab_starts(response: Response, days: int = Query(14)):
     candidates = {pid: lv for pid, lv in started_at.items() if exp.get(pid)}
 
     rows = []
+    enrich_deadline = time.time() + _REHAB_ENRICH_BUDGET_S
+
+    def _attach_pitch_metrics(row, pid):
+        """SwStr%/CSW%/velocity for the one start the table renders.
+
+        The box-score gameLog carries none of these, so they come from the
+        game's play-by-play feed. Only the LATEST start is enriched — that is
+        the only row the view shows — which keeps this at one feed per
+        rehabbing pitcher rather than one per start, and every feed is cached
+        by game_pk for 30 days.
+        """
+        game_pk = row.get("game_pk")
+        if not game_pk:
+            return
+        allow_fetch = time.time() < enrich_deadline
+        try:
+            metrics = (get_game_pitch_metrics(game_pk, allow_fetch) or {}).get(int(pid))
+        except Exception as e:
+            print(f"[RehabStarts] pitch metrics failed for game {game_pk}: {e}")
+            return
+        if not metrics:
+            return
+        row["csw_pct"] = metrics.get("csw_pct")
+        row["swstr_pct"] = metrics.get("swstr_pct")
+        row["whiffs"] = metrics.get("whiffs")
+        # Velocity exists only where the level is pitch-tracked. Gating on the
+        # level rather than on the feed keeps the column honest: a stray reading
+        # in a Rookie-ball feed would otherwise print as a real average.
+        if row.get("level") in STATCAST_LEVELS:
+            row["avg_velo"] = metrics.get("avg_velo")
 
     def _starts_for(pid, levels):
         found = []
@@ -1445,6 +1482,9 @@ def rehab_starts(response: Response, days: int = Query(14)):
                 if g.get("date", "") < start_date or not g.get("games_started"):
                     continue
                 found.append(g)
+        if found:
+            found.sort(key=lambda g: g.get("date") or "")
+            _attach_pitch_metrics(found[-1], pid)
         return found
 
     with ThreadPoolExecutor(max_workers=8) as pool:

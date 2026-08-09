@@ -239,3 +239,25 @@ def test_hardness_distribution_and_spray_flip_with_handedness():
     assert m["hard_pct"] == 33.3
     assert m["soft_pct"] == 33.3
     assert m["med_pct"] == 33.3
+
+
+def _pitch_v(index, code, speed):
+    e = _pitch(index, code)
+    if speed is not None:
+        e["pitchData"] = {"startSpeed": speed}
+    return e
+
+
+def test_avg_velo_averages_only_pitches_that_carry_a_reading():
+    # A pitch-tracked feed: the untracked pitch must not drag the mean toward 0.
+    m = b._derive_pitch_metrics(_feed([_play(1, [
+        _pitch_v(0, "C", 94.0), _pitch_v(1, "S", 96.0), _pitch_v(2, "B", None),
+    ])]))[1]
+    assert m["avg_velo"] == 95.0
+    assert m["tracked_pitches"] == 3
+
+
+def test_avg_velo_is_none_without_start_speed():
+    # The normal case below AAA — the UI renders a hyphen, not 0.0.
+    m = b._derive_pitch_metrics(_feed([_play(1, [_pitch(0, "C"), _pitch(1, "B")])]))[1]
+    assert m["avg_velo"] is None

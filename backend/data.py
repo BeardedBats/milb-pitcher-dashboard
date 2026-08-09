@@ -13,7 +13,7 @@ import pandas as pd
 import requests
 from redis_cache import (
     redis_get, redis_set, redis_delete, redis_delete_many, redis_sadd,
-    redis_smembers, redis_srem, redis_available, redis_incr,
+    redis_smembers, redis_srem, redis_available, redis_incr, redis_exists,
 )
 from season import (
     SEASON_START, season_start, now_et as _now_et, ET_ZONE,
@@ -1954,7 +1954,20 @@ def _mark_range_day_baked(date_str):
 
 
 def missing_range_days(start_date, end_date):
-    """Days in the window with no persisted range_day snapshot yet."""
+    """Days in the window with no persisted range_day snapshot yet.
+
+    CHEAP BUT NOT AUTHORITATIVE — one SMEMBERS, and it errs in BOTH directions:
+
+      - it can UNDER-report, because the marker set postdates the snapshots, so
+        a day baked before the set existed has a snapshot but no marker;
+      - it can OVER-report a day as baked, because members outlive the thing
+        they describe. Snapshots expire individually on RANGE_DAY_TTL, while
+        the set's TTL is pushed forward by every new sadd, so the set keeps
+        naming days whose snapshots are long gone.
+
+    Use it to make the common case cheap, never to conclude that a range is
+    complete — see unbaked_range_days for that.
+    """
     try:
         baked = set(redis_smembers(_baked_days_key()) or [])
     except Exception:
@@ -1964,6 +1977,29 @@ def missing_range_days(start_date, end_date):
         # Today is fetched live and never baked, so it is never "missing".
         if not _is_today(day) and day not in baked
     ]
+
+
+def unbaked_range_days(start_date, end_date, limit=None):
+    """Days whose snapshot is ACTUALLY absent, verified with EXISTS.
+
+    The authoritative counterpart to missing_range_days, for the one decision
+    that must not be wrong: declaring a materialization job finished. Probes
+    oldest-first because expiry reaches the oldest day first, and stops at
+    `limit` hits so the "yes, something is missing" answer stays cheap.
+
+    A day is only reported missing when Redis positively says the key is gone.
+    An unreachable Redis yields no days, so a connection blip reads as "nothing
+    to do" rather than triggering a full re-bake of the season.
+    """
+    found = []
+    for day in _date_strings(start_date, end_date):
+        if _is_today(day):
+            continue  # fetched live, never baked
+        if redis_exists(_range_day_key(day)) is False:
+            found.append(day)
+            if limit is not None and len(found) >= limit:
+                break
+    return found
 
 
 # How many days one cron invocation will bake. A full season is ~134 days and
@@ -1999,6 +2035,15 @@ def drain_pending_materializations(max_jobs=1, deadline=None):
         try:
             missing = missing_range_days(start_date, end_date)
             if not missing:
+                # The marker set says complete — but it OVER-reports (see
+                # missing_range_days), and this is the one place where
+                # believing it is unrecoverable: the job would be marked ready
+                # and dropped from the queue while the range is still full of
+                # holes, and nothing re-queues it until the next daily warmup,
+                # which would then be dequeued the same way. That is a silent
+                # permanent stall, not a slow one. Confirm with real EXISTS.
+                missing = unbaked_range_days(start_date, end_date)
+            if not missing:
                 redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
                 redis_srem(MATERIALIZE_PENDING_KEY, token)
                 drained.append({"start_date": start_date, "end_date": end_date,
@@ -2022,6 +2067,12 @@ def drain_pending_materializations(max_jobs=1, deadline=None):
                 }, ttl=MATERIALIZE_STATUS_TTL)
 
             remaining = len(missing) - baked
+            if remaining <= 0:
+                # Arithmetic says done, which assumes every fetch_date that
+                # didn't raise also persisted its snapshot. Confirm the same way
+                # as above; limit=1 because all that matters here is whether ANY
+                # day is still absent (so days_left reads as "at least 1").
+                remaining = len(unbaked_range_days(start_date, end_date, limit=1))
             if remaining <= 0:
                 redis_set(status_key, {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
                 redis_srem(MATERIALIZE_PENDING_KEY, token)

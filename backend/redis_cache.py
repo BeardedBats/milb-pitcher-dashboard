@@ -168,6 +168,24 @@ def redis_srem(key, *values):
         print(f"[Redis] SREM error for {key}: {e}")
 
 
+def redis_exists(key):
+    """Does this key exist? None when Redis itself is unreachable.
+
+    EXISTS, not GET: presence checks over a range of day snapshots must not
+    drag multi-MB compressed payloads across the wire just to be discarded.
+    The None-vs-False distinction matters — a caller deciding whether work is
+    finished must not read "Redis is down" as "the key is gone".
+    """
+    r = _get_redis()
+    if r is None:
+        return None
+    try:
+        return bool(r.exists(key))
+    except Exception as e:
+        print(f"[Redis] EXISTS error for {key}: {e}")
+        return None
+
+
 def redis_incr(key):
     """Atomically increment an integer key in Redis. Returns the new value."""
     r = _get_redis()

@@ -1,14 +1,15 @@
-"""MLB-side lookups: big-league experience and injured-list / rehab status.
+"""MLB-side lookups: big-league experience, injured-list status, current club.
 
-Everything else in this app deliberately ignores sportId 1. These two features
-are the exception — both are questions ABOUT the major leagues asked of
+Everything else in this app deliberately ignores sportId 1. These features are
+the exception — each is a question ABOUT the major-league side asked of
 minor-league pitchers:
 
   * has this pitcher ever debuted in the majors?  (name highlight)
   * is he on an MLB injured list right now?       (Rehab SP view)
+  * which club is he on RIGHT NOW?                (player pool / current team)
 
-No major-league games or stats are ever displayed; only these two flags cross
-the boundary.
+No major-league games or stats are ever displayed; only these flags cross the
+boundary.
 """
 import threading
 import time
@@ -37,6 +38,10 @@ _DEBUT_TTL = 24 * 3600
 # Roster/IL status moves daily; an hour keeps the Rehab view current without
 # hammering 30 endpoints.
 _ROSTER_TTL = 3600
+# Current club moves on every transaction — and in the days around the trade
+# deadline it moves in bursts. Six hours bounds how stale the player pool can
+# be between the nightly rebuild and the manual refresh endpoint.
+_CURRENT_TEAM_TTL = 6 * 3600
 
 # status.code values that mean "on an injured list". RA (Rehab Assignment) is
 # included because that is precisely the state this feature is looking for —
@@ -48,6 +53,8 @@ _debut_cache = {}     # {pitcher_id: bool}
 _debut_lock = threading.Lock()
 _roster_cache = {"ts": 0.0, "data": None}
 _roster_lock = threading.Lock()
+_current_team_cache = {}   # {pitcher_id: (timestamp, resolved dict)}
+_current_team_lock = threading.Lock()
 
 
 def _l2_get(key):
@@ -134,6 +141,226 @@ def tag_mlb_experience(rows, id_key="pitcher_id", flag="mlb_exp"):
         if pid is not None:
             r[flag] = bool(exp.get(int(pid), False))
     return rows
+
+
+# ── Current club (the player pool's team mapping) ──────────────────────────
+#
+# WHY THIS IS NOT "the level of the last game".
+#
+# `current_level` is defined as the level of the pitcher's most recent
+# appearance, and that rule stays exactly as it is. It cannot answer "who does
+# this pitcher belong to?" though: a prospect traded at the deadline keeps a
+# last game played for his OLD org until he takes the ball for the new one,
+# which in practice can be a week or more (and for an injured player, never).
+#
+# The person record's `currentTeam` is the transaction feed's answer and flips
+# the day the trade is processed, so it — not the game log — is what maps a
+# player to his current club.
+
+
+def _resolve_current_team(team):
+    """Turn a person record's `currentTeam` into our (team, level, org) shape.
+
+    Three cases, all real:
+      * a MiLB affiliate  -> found in the level registry, org comes with it;
+      * an MLB club       -> absent from the registry (sportId 1 is excluded
+        everywhere), so the org is read off the club name instead and `level`
+        stays None — the player is in the majors, not at a level this app
+        covers;
+      * anything else (foreign/independent clubs, a blank record) -> name only.
+    """
+    from levels import ORG_ABBREV, team_meta_by_id
+
+    if not isinstance(team, dict):
+        return None
+    team_id = team.get("id")
+    name = (team.get("name") or "").strip()
+    meta = team_meta_by_id(team_id) if team_id is not None else None
+    if meta:
+        return {
+            "team_id": int(meta["team_id"]),
+            "team_name": meta.get("name") or name,
+            "team": meta.get("abbrev") or "",
+            "level": meta.get("level"),
+            "org": meta.get("org"),
+            "mlb_roster": False,
+        }
+    if not team_id and not name:
+        return None
+    org = ORG_ABBREV.get(name)
+    return {
+        "team_id": int(team_id) if team_id is not None else None,
+        "team_name": name,
+        # An MLB club has no MiLB abbreviation; the org abbrev is the sensible
+        # display token ("TB"). `level` stays None rather than becoming "MLB":
+        # every level string in this app is a registry code, and normalize_level
+        # would silently coerce an unknown one to AAA. The flag carries the fact
+        # instead.
+        "team": org or "",
+        "level": None,
+        "org": org,
+        "mlb_roster": bool(org),
+    }
+
+
+def _fetch_current_teams(batch):
+    """One people call for up to 100 ids -> {pitcher_id: resolved dict}."""
+    try:
+        resp = requests.get(
+            _PEOPLE_URL.format(ids=",".join(str(x) for x in batch)), timeout=20
+        )
+        resp.raise_for_status()
+        people = resp.json().get("people") or []
+    except Exception as e:
+        print(f"[MLBStatus] currentTeam lookup failed for {len(batch)} ids: {e}")
+        return {}
+    out = {}
+    for p in people:
+        try:
+            pid = int(p["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        resolved = _resolve_current_team(p.get("currentTeam"))
+        if resolved:
+            out[pid] = resolved
+        # The same payload carries mlbDebutDate, so fill the debut cache for
+        # free rather than paying for a second sweep of the same 100 players.
+        debut = bool(p.get("mlbDebutDate"))
+        with _debut_lock:
+            _debut_cache[pid] = debut
+        _l2_set(f"{_PREFIX}:debut:{pid}", {"v": debut}, _DEBUT_TTL)
+    return out
+
+
+def get_current_teams(pitcher_ids, refresh=False, deadline=None):
+    """{pitcher_id: {team_id, team_name, team, level, org}} — where each pitcher
+    is RIGHT NOW, per the MLB transaction feed.
+
+    Batched 100 ids to a request (the people endpoint's practical limit) and
+    cached per player, so the nightly directory rebuild costs ~45 requests for
+    the whole player pool and every later reader costs zero.
+
+    `refresh=True` bypasses both cache tiers — that is the trade-deadline
+    button, for when a 6-hour-old mapping is not good enough. `deadline` caps
+    how long the sweep may run: past it, the players not yet resolved are
+    simply omitted, which degrades the pool to its season history rather than
+    failing the caller outright.
+    """
+    ids = {int(p) for p in (pitcher_ids or []) if p is not None}
+    if not ids:
+        return {}
+    out, missing = {}, []
+    now = time.time()
+    if refresh:
+        missing = sorted(ids)
+    else:
+        with _current_team_lock:
+            for pid in sorted(ids):
+                hit = _current_team_cache.get(pid)
+                if hit and (now - hit[0]) < _CURRENT_TEAM_TTL:
+                    out[pid] = hit[1]
+                else:
+                    missing.append(pid)
+        still = []
+        for pid in missing:
+            cached = _l2_get(f"{_PREFIX}:curteam:{pid}")
+            if isinstance(cached, dict) and cached:
+                out[pid] = cached
+                with _current_team_lock:
+                    _current_team_cache[pid] = (now, cached)
+            else:
+                still.append(pid)
+        missing = still
+
+    batches = [missing[i:i + 100] for i in range(0, len(missing), 100)]
+    if batches:
+        pool = ThreadPoolExecutor(max_workers=6)
+        try:
+            futures = [pool.submit(_fetch_current_teams, b) for b in batches]
+            for f in as_completed(futures):
+                if deadline is not None and time.time() >= deadline:
+                    print("[MLBStatus] deadline hit, deferring remaining current-team batches")
+                    break
+                try:
+                    fetched = f.result() or {}
+                except Exception:
+                    continue
+                stamp = time.time()
+                for pid, resolved in fetched.items():
+                    out[pid] = resolved
+                    with _current_team_lock:
+                        _current_team_cache[pid] = (stamp, resolved)
+                    _l2_set(f"{_PREFIX}:curteam:{pid}", resolved, _CURRENT_TEAM_TTL)
+        finally:
+            # Same rule as prefetch_boxscores: when bounded, never block on
+            # in-flight requests past the caller's budget. A serverless
+            # instance is frozen the moment it responds, so waiting on the
+            # remaining batches only burns the cron's remaining seconds.
+            pool.shutdown(wait=(deadline is None))
+    return out
+
+
+def tag_current_team(rows, id_key="pitcher_id", refresh=False, deadline=None):
+    """Stamp `team`/`org`/`team_name` on directory rows and reorder their
+    season history so the CURRENT club leads.
+
+    The history lists (`teams`, `orgs`, `levels`) are kept intact — a traded
+    pitcher's old affiliate is still where half his season happened, and the
+    org pages need it. Only the ordering changes, plus the explicit current-*
+    fields the UI reads.
+
+    Rows whose current club can't be resolved are left exactly as they were:
+    an unknown mapping must not overwrite a known-good season history.
+    """
+    if not rows:
+        return rows
+    current = get_current_teams(
+        [r.get(id_key) for r in rows if r.get(id_key) is not None],
+        refresh=refresh,
+        deadline=deadline,
+    )
+    for r in rows:
+        pid = r.get(id_key)
+        if pid is None:
+            continue
+        info = current.get(int(pid))
+        if not info:
+            continue
+        team, org, level = info.get("team"), info.get("org"), info.get("level")
+        if team:
+            r["team"] = team
+        if org:
+            r["org"] = org
+        if info.get("team_name"):
+            r["team_name"] = info["team_name"]
+        # The level of the club he is on now — deliberately NOT `current_level`,
+        # which is defined elsewhere as the level of his last game and must
+        # keep meaning exactly that.
+        #
+        # Absent rather than null when there is no MiLB level to report, so the
+        # directory doesn't carry ~4,500 dead keys; `mlb_roster` is what says
+        # "he's up", and it is likewise only present when true.
+        if level:
+            r["team_level"] = level
+        else:
+            r.pop("team_level", None)
+        if info.get("mlb_roster"):
+            r["mlb_roster"] = True
+        else:
+            r.pop("mlb_roster", None)
+        r["teams"] = _current_first(r.get("teams"), team)
+        r["orgs"] = _current_first(r.get("orgs"), org)
+        if level:
+            r["levels"] = _current_first(r.get("levels"), level)
+    return rows
+
+
+def _current_first(values, current):
+    """`values` with `current` moved to the front (added if absent)."""
+    items = [v for v in (values or []) if v]
+    if not current:
+        return items
+    return [current] + [v for v in items if v != current]
 
 
 # ── Injured list ───────────────────────────────────────────────────────────

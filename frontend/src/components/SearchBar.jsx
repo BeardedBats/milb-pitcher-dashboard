@@ -1,5 +1,16 @@
 import React, { useState, useRef, useEffect } from "react";
 import { fetchPitchersDirectory, fetchPitchersSearch } from "../utils/api";
+import { displayTeamAbbrev } from "../constants";
+
+// "SWB · AAA" — the club the pitcher is on RIGHT NOW, from the directory's
+// transaction-backed mapping (not wherever he last appeared). `team_level` is
+// null for a pitcher currently on an MLB roster, which `mlb_roster` marks.
+function currentClubLabel(p) {
+  const team = displayTeamAbbrev(p.team) || "";
+  const level = p.mlb_roster ? "MLB" : p.team_level || "";
+  if (team && level) return `${team} · ${level}`;
+  return team || level;
+}
 
 // Accent-stripped lowercase — mirrors backend _name_search_norm so client-side
 // matching behaves identically ("emerson" ↔ "Émerson").
@@ -176,16 +187,20 @@ export default function SearchBar({ onSelectPlayer }) {
       />
       {open && results.length > 0 && (
         <div className="search-dropdown">
-          {results.map((p, idx) => (
-            <div
-              key={p.pitcher_id}
-              className={`search-result${idx === highlightIdx ? " highlighted" : ""}`}
-              onClick={(e) => handleSelect(p, e)}
-              onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); handleSelect(p, e); } }}
-            >
-              <span className="search-result-name">{p.name}</span>
-            </div>
-          ))}
+          {results.map((p, idx) => {
+            const club = currentClubLabel(p);
+            return (
+              <div
+                key={p.pitcher_id}
+                className={`search-result${idx === highlightIdx ? " highlighted" : ""}`}
+                onClick={(e) => handleSelect(p, e)}
+                onMouseDown={(e) => { if (e.button === 1) { e.preventDefault(); handleSelect(p, e); } }}
+              >
+                <span className="search-result-name">{p.name}</span>
+                {club && <span className="search-result-meta">{club}</span>}
+              </div>
+            );
+          })}
         </div>
       )}
       {open && results.length === 0 && query.trim() && (

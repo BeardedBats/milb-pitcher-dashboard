@@ -55,12 +55,13 @@ from levels import (
 )
 from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
-    get_team_season_pitchers, get_all_milb_pitchers,
+    get_team_season_pitchers, get_all_milb_pitchers, cached_milb_pitchers,
     enrich_log_with_pitch_metrics, get_game_pitch_metrics,
     _METRICS_VERSION, _gamelog_for_level,
 )
 from mlb_status import (
     get_mlb_experience, tag_mlb_experience, get_il_pitchers, get_starters_in_range,
+    tag_current_team,
 )
 from redis_cache import redis_get, redis_set, redis_delete
 
@@ -928,6 +929,33 @@ def _merge_multi_level_game_log(pitcher_id, season_year, savant_log):
     return merged
 
 
+def _tag_info_current_team(info, pitcher_id):
+    """Stamp the player-page header's `info` with the pitcher's current club.
+
+    Best-effort by design: the header already renders from the game log, so a
+    transaction-feed hiccup should cost the page its current-club tag and
+    nothing else.
+    """
+    try:
+        row = {"pitcher_id": int(pitcher_id), "teams": info.get("teams") or []}
+        tag_current_team([row])
+    except Exception as e:
+        print(f"[PlayerPage] current-team lookup failed for {pitcher_id}: {e}")
+        return info
+    info["teams"] = row.get("teams") or info.get("teams") or []
+    if row.get("team"):
+        info["current_team"] = row["team"]
+    elif info["teams"]:
+        info["current_team"] = info["teams"][0]
+    if row.get("org"):
+        info["current_org"] = row["org"]
+    if row.get("team_name"):
+        info["current_team_name"] = row["team_name"]
+    if row.get("mlb_roster"):
+        info["on_mlb_roster"] = True
+    return info
+
+
 def _build_player_page_payload(pitcher_id, start_date, end_date, preloaded_df=None, include_extras=True, pitcher_season_fallback=False):
     empty = {
         "info": {}, "pitch_summary": [], "pitch_summary_vs_l": [],
@@ -986,6 +1014,11 @@ def _build_player_page_payload(pitcher_id, start_date, end_date, preloaded_df=No
                 seen.add(t)
                 teams.append(t)
         info["teams"] = teams
+    # Where he is NOW, which is not necessarily where he last pitched — a
+    # deadline trade moves a player weeks before his first game for the new
+    # org, and never at all if he is hurt. tag_current_team reorders `teams`
+    # so the current club leads and fills team/org/team_name in place.
+    _tag_info_current_team(info, pitcher_id)
     result["info"] = info
 
     aaa_games = [g for g in result["game_log"] if g.get("level") == "AAA"]
@@ -1288,20 +1321,29 @@ def _merged_pitcher_directory(start_date, end_date):
     Savant wins on conflict for the fields it has, since its pitch counts are
     per-pitch-accurate and its `hand` is real. Level/org tags ride along from
     the sweep so results can show "(CLE, AA)".
+
+    The sweep also carries the current-club mapping (`team`/`org`), resolved
+    from the transaction feed rather than from where a pitcher last appeared —
+    which is the only way a deadline trade shows up before the player's first
+    game for his new org. Savant rows must not clobber it: its `teams` are
+    appended to the season history, never promoted over the current club.
     """
     savant = fetch_pitchers_directory(start_date, end_date) or []
     try:
         milb = get_all_milb_pitchers(int(start_date[:4])) or []
     except Exception as e:
         print(f"[Directory] all-levels sweep failed, serving Savant-only: {e}")
-        return savant
+        return [_with_fallback_team(dict(r)) for r in savant]
 
     merged = {int(r["pitcher_id"]): dict(r) for r in milb}
     for r in savant:
         pid = int(r["pitcher_id"])
         base = merged.get(pid)
         if base is None:
-            merged[pid] = dict(r)
+            # Savant-only (no season-stats row at any affiliate). No transaction
+            # mapping for him, so the head of his recency-ordered team list is
+            # the best available answer.
+            merged[pid] = _with_fallback_team(dict(r))
             continue
         # Savant's signals are better where present; keep the sweep's tags.
         base.update({
@@ -1314,7 +1356,27 @@ def _merged_pitcher_directory(start_date, end_date):
         for t in (r.get("teams") or []):
             if t and t not in base.get("teams", []):
                 base.setdefault("teams", []).append(t)
+        _with_fallback_team(base)
     return sorted(merged.values(), key=lambda r: r.get("name") or "")
+
+
+def _with_fallback_team(row):
+    """Guarantee a `team`/`org` on a directory row.
+
+    Every row the UI renders should name a club. When the transaction feed
+    couldn't resolve one (a lookup failure, or a player the people endpoint
+    doesn't return), fall back to the first entry of the recency-ordered
+    season history — stale after a trade, but never blank.
+    """
+    if not row.get("team"):
+        teams = row.get("teams") or []
+        if teams:
+            row["team"] = teams[0]
+    if not row.get("org"):
+        orgs = row.get("orgs") or []
+        if orgs:
+            row["org"] = orgs[0]
+    return row
 
 
 @app.get("/api/pitchers-directory")
@@ -1980,6 +2042,60 @@ def cron_warmup_daily_season(request: Request, response: Response):
                 "orgs_skipped": skipped_orgs,
                 "directory_pitchers": directory_size,
                 "budget_hit": bool(skipped_orgs)}
+    except Exception as e:
+        return _json_response({"error": str(e)}, status_code=500, scope="mutation")
+
+
+@app.get("/api/cron/refresh-player-pool")
+def cron_refresh_player_pool(request: Request, response: Response):
+    """Re-resolve every pitcher's current club and rebuild the player pool.
+
+    `warmup-daily-2` already rebuilds the pool nightly, and the current-club
+    mapping has a 6-hour TTL on top of that — which is the right cadence for
+    an ordinary week and the wrong one for deadline day, when a few dozen
+    prospects change organizations inside an hour. This is the button for
+    that: it bypasses both cache tiers and reports what actually moved, so a
+    refresh can be verified instead of assumed.
+    """
+    _set_response_cache(response, "mutation")
+    denied = _require_cron_auth(request)
+    if denied:
+        return denied
+    try:
+        deadline = time.time() + 260
+        season_year = _now_et().year
+        before = {
+            int(r["pitcher_id"]): (r.get("team"), r.get("org"))
+            for r in (cached_milb_pitchers(season_year) or [])
+            if r.get("pitcher_id") is not None
+        }
+        pool = get_all_milb_pitchers(season_year, deadline=deadline, refresh=True) or []
+        moved = []
+        for r in pool:
+            pid = r.get("pitcher_id")
+            if pid is None or int(pid) not in before:
+                continue
+            was_team, was_org = before[int(pid)]
+            now_team, now_org = r.get("team"), r.get("org")
+            if (was_team, was_org) != (now_team, now_org):
+                moved.append({
+                    "pitcher_id": int(pid), "name": r.get("name") or "",
+                    "from": {"team": was_team, "org": was_org},
+                    "to": {"team": now_team, "org": now_org},
+                })
+        moved.sort(key=lambda m: m["name"])
+        return {
+            "status": "ok",
+            "season": season_year,
+            "pitchers": len(pool),
+            "compared_against_cache": bool(before),
+            "changed": len(moved),
+            # Capped: deadline week can move a few hundred players and this
+            # response is read by a human, not a machine.
+            "moves": moved[:100],
+            "moves_truncated": max(0, len(moved) - 100),
+            "budget_hit": time.time() >= deadline,
+        }
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 

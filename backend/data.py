@@ -2226,6 +2226,31 @@ def _name_search_norm(s):
     return strip_accents((s or "").lower())
 
 
+def _teams_by_recency(df):
+    """{pitcher_id: [team, ...]} ordered by each team's LAST appearance, newest
+    first.
+
+    `unique()` returns first-appearance order, which puts the team a traded
+    pitcher LEFT at the head of his list — the one place the season history
+    is read as "who is he with". Ordering by last appearance instead makes the
+    head of the list the best guess available from game data alone; the
+    transaction feed then overrides it (mlb_status.tag_current_team) for the
+    players it can resolve.
+    """
+    if "pitcher_team" not in df.columns or "game_date" not in df.columns:
+        return {}
+    last_seen = (
+        df.groupby(["pitcher", "pitcher_team"])["game_date"].max().reset_index()
+        .sort_values(["pitcher", "game_date"], ascending=[True, False])
+    )
+    out = {}
+    for pid, team in zip(last_seen["pitcher"], last_seen["pitcher_team"]):
+        if pd.isna(team) or not str(team).strip():
+            continue
+        out.setdefault(int(pid), []).append(str(team))
+    return out
+
+
 def build_pitchers_list_from_df(df):
     if df is None or df.empty:
         return []
@@ -2244,12 +2269,15 @@ def build_pitchers_list_from_df(df):
     grouped["pitches"] = df.groupby("pitcher").size()
     grouped = grouped.reset_index()
     records = grouped.to_dict(orient="records")
+    recent_teams = _teams_by_recency(df)
     result = [{
         "pitcher_id": int(r["pitcher"]),
         "name": r["player_name"],
         # Precomputed accent-stripped lowercase name — see _name_search_norm.
         "name_norm": _name_search_norm(r["player_name"]),
-        "teams": r["pitcher_team"] if isinstance(r["pitcher_team"], list) else [r["pitcher_team"]],
+        "teams": recent_teams.get(int(r["pitcher"])) or (
+            r["pitcher_team"] if isinstance(r["pitcher_team"], list) else [r["pitcher_team"]]
+        ),
         "hand": r["p_throws"],
         # Ranking signals consumed by the search UI (see SearchBar.jsx).
         "pitches": int(r["pitches"]),
@@ -2259,8 +2287,22 @@ def build_pitchers_list_from_df(df):
     return result
 
 
+# BUMP THIS whenever a row in the Savant-side pitcher list changes shape or
+# ordering. Both keys below embed it, and both outlive an ordinary deploy —
+# 'pitcher_dir:' never expires at all — so without a bump a shipped change
+# keeps serving the old list indefinitely.
+#   1: {pitcher_id, name, name_norm, teams, hand, pitches, last_date}
+#   2: `teams` ordered by most recent appearance instead of first
+PITCHER_DIR_VERSION = 2
+
+
 def _pitcher_dir_key(start_date, end_date):
-    return f"pitcher_dir:{start_date}_{end_date}"
+    return f"pitcher_dir:v{PITCHER_DIR_VERSION}:{start_date}_{end_date}"
+
+
+def _pitchers_list_key(start_date, end_date):
+    # Keeps the "pitchers:" prefix — clear_cache indexes the whole family off it.
+    return f"pitchers:v{PITCHER_DIR_VERSION}:{start_date}_{end_date}"
 
 
 def _persist_pitcher_directory(start_date, end_date, result):
@@ -2286,7 +2328,7 @@ def fetch_all_pitchers_list_materialized(start_date, end_date):
         ts, result = _pitchers_list_cache[cache_key]
         if not _is_today(end_date) or (time.time() - ts) < RANGE_CACHE_TTL:
             return result
-    redis_key = f"pitchers:{start_date}_{end_date}"
+    redis_key = _pitchers_list_key(start_date, end_date)
     redis_val = redis_get(redis_key)
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
@@ -2348,7 +2390,7 @@ def fetch_pitchers_directory(start_date, end_date):
         if not _is_today(end_date) or (time.time() - ts) < RANGE_CACHE_TTL:
             return result
     # Canonical live/recent key (kept fresh by the warmup crons).
-    redis_val = redis_get(f"pitchers:{start_date}_{end_date}")
+    redis_val = redis_get(_pitchers_list_key(start_date, end_date))
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
         return redis_val

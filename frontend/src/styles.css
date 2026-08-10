@@ -1265,7 +1265,7 @@ canvas { display: block; border: none; border-radius: var(--radius-sm); }
 .search-result:hover, .search-result.highlighted { background: var(--hover-tint); }
 
 .search-result-name { color: var(--name); font-weight: 600; font-size: 13px; }
-.search-result-meta { color: var(--text-dim); font-size: 12px; }
+.search-result-meta { color: var(--text-dim); font-size: 12px; white-space: nowrap; padding-left: 12px; }
 .search-no-results { color: var(--text-dim); font-size: 13px; justify-content: center; cursor: default; }
 
 /* ======== PAGE LAYOUT (shared for Leaderboard, Team pages) ======== */
@@ -1796,14 +1796,41 @@ canvas { display: block; border: none; border-radius: var(--radius-sm); }
 /* Pitchers with major-league service — Changeup green (PITCH_COLORS.Changeup).
    !important because several pitcher-name cells carry an inline color
    (TeamPage) or a competing highlight class (pitcher-sp-highlight), and the
-   MLB-experience tint should win in all of them. */
-.mlb-exp,
-.mlb-exp a,
-a.mlb-exp,
-td.mlb-exp,
-td.mlb-exp a { color: #6DE95D !important; }
+   MLB-experience tint should win in all of them.
 
-/* Rehab SP view */
+   Gated on `.mlb-exp-on` at the app root so the header's MLB Green checkbox
+   turns the tint off everywhere at once. Rows keep their .mlb-exp class either
+   way — only the color rule comes and goes. */
+.mlb-exp-on .mlb-exp,
+.mlb-exp-on .mlb-exp a,
+.mlb-exp-on a.mlb-exp,
+.mlb-exp-on td.mlb-exp,
+.mlb-exp-on td.mlb-exp a { color: #6DE95D !important; }
+
+/* Header nav link styled as a button (Rehab). Anchor, not <button>, so the
+   route can be middle-clicked and copied. */
+.nav-link-btn {
+  display: inline-flex; align-items: center;
+  padding: 6px 14px; border-radius: 4px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-family: inherit; font-size: 13px;
+  text-decoration: none; white-space: nowrap; cursor: pointer;
+}
+.nav-link-btn:hover { border-color: var(--accent); color: var(--accent); }
+.nav-link-btn.active {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(85, 232, 255, 0.12);
+}
+
+/* Rehab page */
+.rehab-title {
+  font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.rehab-subtitle { font-size: 12px; font-weight: 400; color: var(--text-dim); }
+.rehab-pitcher { font-weight: 700; }
+/* A zero is real data but shouldn't read as loud as a count. */
+.zero-cell { color: var(--text-dim); opacity: 0.55; }
 .rehab-date-cell { white-space: nowrap; }
 .rehab-il-tag {
   display: inline-block; margin-left: 6px; padding: 1px 5px;

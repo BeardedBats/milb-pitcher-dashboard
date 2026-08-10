@@ -76,17 +76,55 @@ def test_last_date_is_the_max_not_the_last_folded():
     assert rows[102]["last_date"] == DAYS[1]
 
 
-def test_team_order_follows_first_appearance():
-    a = pd.DataFrame({
-        "game_date": DAYS[0], "game_pk": 1, "pitcher": [101, 101],
-        "player_name": "Solo, S", "p_throws": "R", "pitcher_team": ["WOR", "WOR"],
+def _one_team_day(date_str, team, game_pk):
+    return pd.DataFrame({
+        "game_date": date_str, "game_pk": game_pk, "pitcher": [101],
+        "player_name": "Solo, S", "p_throws": "R", "pitcher_team": [team],
     })
-    b = pd.DataFrame({
-        "game_date": DAYS[1], "game_pk": 2, "pitcher": [101],
-        "player_name": "Solo, S", "p_throws": "R", "pitcher_team": ["BUF"],
+
+
+def test_team_order_follows_most_recent_appearance():
+    """Matches _teams_by_recency: the club a pitcher was traded TO leads, even
+    though the old one owns more of the season. Folding a per-(pitcher, team)
+    max day by day has to give the same answer as the whole-frame groupby."""
+    days = [
+        _one_team_day(DAYS[0], "WOR", 1),
+        _one_team_day(DAYS[1], "WOR", 2),
+        _one_team_day(DAYS[2], "BUF", 3),
+    ]
+    assert _fold(days)[0]["teams"] == ["BUF", "WOR"]
+    assert _fold(days) == _whole(days)
+
+
+def test_a_return_to_a_former_club_puts_it_back_on_top():
+    """Ordering is by LAST appearance, so a demotion-then-promotion reorders."""
+    days = [
+        _one_team_day(DAYS[0], "WOR", 1),
+        _one_team_day(DAYS[1], "BUF", 2),
+        _one_team_day(DAYS[2], "WOR", 3),
+    ]
+    assert _fold(days)[0]["teams"] == ["WOR", "BUF"]
+    assert _fold(days) == _whole(days)
+
+
+def test_blank_and_null_teams_are_dropped_from_the_recency_order():
+    days = [
+        _one_team_day(DAYS[0], "WOR", 1),
+        _one_team_day(DAYS[1], None, 2),
+        _one_team_day(DAYS[2], "  ", 3),
+    ]
+    assert _fold(days)[0]["teams"] == ["WOR"]
+
+
+def test_frame_without_game_date_falls_back_to_first_appearance_order():
+    """Partial/legacy frames carry no game_date, so there is nothing to order
+    by — both implementations fall back to unique() order."""
+    day = pd.DataFrame({
+        "game_pk": [1, 2], "pitcher": [101, 101],
+        "player_name": "Solo, S", "p_throws": "R", "pitcher_team": ["WOR", "BUF"],
     })
-    assert _fold([a, b])[0]["teams"] == ["WOR", "BUF"]
-    assert _fold([a, b]) == _whole([a, b])
+    assert _fold([day])[0]["teams"] == ["WOR", "BUF"]
+    assert _fold([day]) == _whole([day])
 
 
 def test_first_non_null_name_and_hand_win():

@@ -2369,6 +2369,31 @@ def _name_search_norm(s):
     return strip_accents((s or "").lower())
 
 
+def _teams_by_recency(df):
+    """{pitcher_id: [team, ...]} ordered by each team's LAST appearance, newest
+    first.
+
+    `unique()` returns first-appearance order, which puts the team a traded
+    pitcher LEFT at the head of his list — the one place the season history
+    is read as "who is he with". Ordering by last appearance instead makes the
+    head of the list the best guess available from game data alone; the
+    transaction feed then overrides it (mlb_status.tag_current_team) for the
+    players it can resolve.
+    """
+    if "pitcher_team" not in df.columns or "game_date" not in df.columns:
+        return {}
+    last_seen = (
+        df.groupby(["pitcher", "pitcher_team"])["game_date"].max().reset_index()
+        .sort_values(["pitcher", "game_date"], ascending=[True, False])
+    )
+    out = {}
+    for pid, team in zip(last_seen["pitcher"], last_seen["pitcher_team"]):
+        if pd.isna(team) or not str(team).strip():
+            continue
+        out.setdefault(int(pid), []).append(str(team))
+    return out
+
+
 def build_pitchers_list_from_df(df):
     if df is None or df.empty:
         return []
@@ -2387,12 +2412,15 @@ def build_pitchers_list_from_df(df):
     grouped["pitches"] = df.groupby("pitcher").size()
     grouped = grouped.reset_index()
     records = grouped.to_dict(orient="records")
+    recent_teams = _teams_by_recency(df)
     result = [{
         "pitcher_id": int(r["pitcher"]),
         "name": r["player_name"],
         # Precomputed accent-stripped lowercase name — see _name_search_norm.
         "name_norm": _name_search_norm(r["player_name"]),
-        "teams": r["pitcher_team"] if isinstance(r["pitcher_team"], list) else [r["pitcher_team"]],
+        "teams": recent_teams.get(int(r["pitcher"])) or (
+            r["pitcher_team"] if isinstance(r["pitcher_team"], list) else [r["pitcher_team"]]
+        ),
         "hand": r["p_throws"],
         # Ranking signals consumed by the search UI (see SearchBar.jsx).
         "pitches": int(r["pitches"]),
@@ -2411,9 +2439,10 @@ def build_pitchers_list_from_df(df):
 # same groupby one day at a time, so peak memory is one day.
 #
 # The aggregation is foldable because every field is either order-independent
-# or a running extreme: first-non-null name/hand, unique team list, summed
-# pitch count, max game_date. Days are folded in date order, so "first" means
-# what it means in the whole-frame groupby. Equivalence is pinned by
+# or a running extreme: first-non-null name/hand, summed pitch count, max
+# game_date, and per-(pitcher, team) last-seen dates for the recency ordering.
+# Days are folded in date order, so "first" means what it means in the
+# whole-frame groupby. Equivalence is pinned by
 # backend/tests/test_pitchers_directory_stream.py — keep that test green.
 
 def _is_nullish(v):
@@ -2446,10 +2475,18 @@ def accumulate_pitchers_list(acc, day_df):
     sizes = grouped.size()
     day_agg = grouped.agg(spec) if spec else None
 
+    # Per-(pitcher, team) last appearance — the streaming half of
+    # _teams_by_recency. A max is a running extreme, so folding it day by day
+    # gives exactly what the whole-frame groupby gives.
+    if {"pitcher_team", "game_date"}.issubset(day_df.columns):
+        day_last = day_df.groupby(["pitcher", "pitcher_team"])["game_date"].max()
+    else:
+        day_last = None
+
     for pid, n in sizes.items():
         entry = acc.get(pid)
         if entry is None:
-            entry = {"name": None, "teams": [], "hand": None,
+            entry = {"name": None, "teams": [], "team_last": {}, "hand": None,
                      "pitches": 0, "last_date": None}
             acc[pid] = entry
         # Pitch count is a plain sum — the one field that would be wrong if a
@@ -2465,6 +2502,8 @@ def accumulate_pitchers_list(acc, day_df):
         hand = row.get("p_throws")
         if entry["hand"] is None and not _is_nullish(hand):
             entry["hand"] = hand
+        # First-appearance order, kept only as the no-game_date fallback that
+        # build_pitchers_list_from_df also falls back to.
         teams = row.get("pitcher_team")
         if isinstance(teams, list):
             for t in teams:
@@ -2476,6 +2515,32 @@ def accumulate_pitchers_list(acc, day_df):
             if entry["last_date"] is None or game_date > entry["last_date"]:
                 entry["last_date"] = game_date
 
+    if day_last is not None:
+        for (pid, team), seen in day_last.items():
+            entry = acc.get(pid)
+            if entry is None or _is_nullish(team) or not str(team).strip():
+                continue
+            team = str(team)
+            seen = str(seen)
+            if entry["team_last"].get(team) is None or seen > entry["team_last"][team]:
+                entry["team_last"][team] = seen
+
+
+def _ordered_teams(entry):
+    """Newest club first — the streaming equivalent of _teams_by_recency.
+
+    Ties are broken on team name so the order is deterministic; the whole-frame
+    sort leaves same-date ties unspecified, so this is a tightening, not a
+    divergence. Falls back to first-appearance order when the frames carried no
+    game_date, exactly as build_pitchers_list_from_df does.
+    """
+    recency = entry["team_last"]
+    if not recency:
+        return list(entry["teams"])
+    teams = sorted(recency)                                   # deterministic tiebreak
+    teams.sort(key=lambda t: recency[t], reverse=True)        # stable: date DESC
+    return teams
+
 
 def finalize_pitchers_list(acc):
     result = [{
@@ -2483,7 +2548,7 @@ def finalize_pitchers_list(acc):
         "name": entry["name"],
         # Precomputed accent-stripped lowercase name — see _name_search_norm.
         "name_norm": _name_search_norm(entry["name"]),
-        "teams": list(entry["teams"]),
+        "teams": _ordered_teams(entry),
         "hand": entry["hand"],
         # Ranking signals consumed by the search UI (see SearchBar.jsx).
         "pitches": int(entry["pitches"]),
@@ -2493,8 +2558,22 @@ def finalize_pitchers_list(acc):
     return result
 
 
+# BUMP THIS whenever a row in the Savant-side pitcher list changes shape or
+# ordering. Both keys below embed it, and both outlive an ordinary deploy —
+# 'pitcher_dir:' never expires at all — so without a bump a shipped change
+# keeps serving the old list indefinitely.
+#   1: {pitcher_id, name, name_norm, teams, hand, pitches, last_date}
+#   2: `teams` ordered by most recent appearance instead of first
+PITCHER_DIR_VERSION = 2
+
+
 def _pitcher_dir_key(start_date, end_date):
-    return f"pitcher_dir:{start_date}_{end_date}"
+    return f"pitcher_dir:v{PITCHER_DIR_VERSION}:{start_date}_{end_date}"
+
+
+def _pitchers_list_key(start_date, end_date):
+    # Keeps the "pitchers:" prefix — clear_cache indexes the whole family off it.
+    return f"pitchers:v{PITCHER_DIR_VERSION}:{start_date}_{end_date}"
 
 
 def _persist_pitcher_directory(start_date, end_date, result):
@@ -2520,7 +2599,7 @@ def fetch_all_pitchers_list_materialized(start_date, end_date):
         ts, result = _pitchers_list_cache[cache_key]
         if not _is_today(end_date) or (time.time() - ts) < RANGE_CACHE_TTL:
             return result
-    redis_key = f"pitchers:{start_date}_{end_date}"
+    redis_key = _pitchers_list_key(start_date, end_date)
     redis_val = redis_get(redis_key)
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
@@ -2602,7 +2681,7 @@ def fetch_pitchers_directory(start_date, end_date):
         if not _is_today(end_date) or (time.time() - ts) < RANGE_CACHE_TTL:
             return result
     # Canonical live/recent key (kept fresh by the warmup crons).
-    redis_val = redis_get(f"pitchers:{start_date}_{end_date}")
+    redis_val = redis_get(_pitchers_list_key(start_date, end_date))
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
         return redis_val

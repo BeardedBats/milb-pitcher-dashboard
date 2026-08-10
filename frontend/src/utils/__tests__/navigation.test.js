@@ -5,6 +5,9 @@ import {
   buildPlayerHash,
   buildTeamHash,
   isNewWindowClick,
+  homePath,
+  isRehabPath,
+  REHAB_PATH,
 } from "../navigation";
 
 describe("hash builders", () => {
@@ -49,5 +52,32 @@ describe("isNewWindowClick", () => {
     expect(isNewWindowClick({ button: 1 })).toBe(true);
     expect(isNewWindowClick({})).toBeFalsy();
     expect(isNewWindowClick(null)).toBeFalsy();
+  });
+});
+
+describe("path routes", () => {
+  const setPath = (pathname) => {
+    delete window.location;
+    window.location = { pathname, origin: "https://example.test" };
+  };
+
+  test("isRehabPath matches /rehab with or without a trailing slash", () => {
+    setPath(REHAB_PATH);
+    expect(isRehabPath()).toBe(true);
+    setPath("/rehab/");
+    expect(isRehabPath()).toBe(true);
+    setPath("/");
+    expect(isRehabPath()).toBe(false);
+    setPath("/rehabilitation");
+    expect(isRehabPath()).toBe(false);
+  });
+
+  test("homePath strips the rehab segment so hash links never inherit it", () => {
+    setPath(REHAB_PATH);
+    expect(homePath()).toBe("/");
+    setPath("/rehab/");
+    expect(homePath()).toBe("/");
+    setPath("/");
+    expect(homePath()).toBe("/");
   });
 });

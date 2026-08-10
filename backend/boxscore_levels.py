@@ -22,6 +22,7 @@ from levels import (
     DEFAULT_LEVEL, LEVEL_ORDER, LEVELS, normalize_level, org_for_team,
     team_display_name, team_meta_by_id,
 )
+from mlb_status import tag_current_team
 
 _BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
 # The live feed carries the box score AND the play-by-play in one response, so
@@ -112,11 +113,12 @@ _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 #   2: initial derived rows (whiffs, CSW%, SwStr%, GB/FB/LD, Hard%) — shipped
 #      as a hand-written literal "rows:v2", which is why numbering starts here
 #   3: five metric families + per-hand splits
+#   4: avg_velo (feed startSpeed; None wherever the level isn't pitch-tracked)
 #
 # Note the near-miss: replacing the literal with a constant set to 2 produced a
 # byte-identical key and kept serving the very rows the bump was meant to
 # retire. A version bump is only real if the resulting key string changes.
-_METRICS_VERSION = 3
+_METRICS_VERSION = 4
 
 
 def _l2_get(key):
@@ -254,6 +256,10 @@ def _new_bucket():
         "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0,
         "soft": 0, "medium": 0, "hard": 0, "hardness_known": 0,
         "pull": 0, "center": 0, "oppo": 0, "spray_known": 0,
+        # Velocity carries a (sum, count) pair rather than a running mean so
+        # buckets stay mergeable and pitches without a reading don't drag the
+        # average toward zero.
+        "velo_sum": 0.0, "velo_count": 0,
     }
 
 
@@ -289,6 +295,9 @@ def _finalize(m):
     sk = m["spray_known"]
     return {
         "tracked_pitches": p,
+        # None (not 0.0) when nothing was tracked, so the UI shows a hyphen —
+        # the normal case below AAA, where the feed carries no startSpeed.
+        "avg_velo": round(m["velo_sum"] / m["velo_count"], 1) if m["velo_count"] else None,
         "whiffs": m["whiffs"],
         "called_strikes": m["called_strikes"],
         "swings": m["swings"],
@@ -332,17 +341,22 @@ def _finalize(m):
 def _derive_pitch_metrics(feed):
     """Per-pitcher pitch-level metrics from the play-by-play.
 
-    These levels have no Statcast — no velocity, pitch type or movement
-    (verified: startSpeed and details.type are absent on every pitch at every
-    level). But every pitch carries a CALL, a ball/strike COUNT, a batter
-    HANDEDNESS and a plate LOCATION, and every ball in play carries a
-    trajectory, hardness and fielder. That is enough for five metric families:
+    The non-Statcast levels this was written for have no pitch type or movement
+    (verified: startSpeed and details.type are absent on every pitch below AAA).
+    But every pitch carries a CALL, a ball/strike COUNT, a batter HANDEDNESS and
+    a plate LOCATION, and every ball in play carries a trajectory, hardness and
+    fielder. That is enough for five metric families:
 
         plate discipline  CSW%, SwStr%, Whiff%, Swing%, Contact%
         count             F-Strike%, 2Str%, PAR%
         zone              Zone%, O-Swing%, Z-Swing%, Z-Contact%, O-Contact%
         batted ball       GB/FB/LD/PU%, GB/FB
         contact quality   Soft/Med/Hard%, Pull/Center/Oppo%
+
+    `avg_velo` rides along for the callers that reach this function with a
+    pitch-tracked game (the Rehab view enriches AAA starts here): startSpeed is
+    read when the feed has it and left None when it doesn't, so the same code
+    path serves both without the caller having to know the level.
 
     Each family is also split by batter handedness into `splits.L` / `splits.R`.
 
@@ -419,9 +433,19 @@ def _derive_pitch_metrics(feed):
                 )
                 is_swing = code in _SWING_CODES
                 is_contact = code in _CONTACT_CODES
+                # Present at the pitch-tracked levels, absent below them. Read
+                # defensively: a single unparseable reading must not poison the
+                # whole game's average.
+                try:
+                    speed = float(pitch_data.get("startSpeed"))
+                except (TypeError, ValueError):
+                    speed = None
 
                 for m in buckets_for(current, bat_side):
                     m["tracked_pitches"] += 1
+                    if speed:
+                        m["velo_sum"] += speed
+                        m["velo_count"] += 1
                     if code in _WHIFF_CODES:
                         m["whiffs"] += 1
                     elif code in _CALLED_CODES:
@@ -932,8 +956,37 @@ def enrich_log_with_pitch_metrics(rows, pitcher_id, deadline=None, max_fetch=25)
 _DIRECTORY_TTL = 6 * 3600
 _directory_cache = {}  # { season: (timestamp, rows) }
 
+# BUMP THIS whenever a directory row gains, loses or changes a field.
+#
+# The directory is the player pool the search bar loads once and filters
+# locally, so a shape change that doesn't move the key string just serves the
+# old shape until the TTL happens to lapse — six hours of a half-deployed
+# player pool. Same rule as _METRICS_VERSION: the bump is only real if the
+# resulting key STRING changes.
+#   1: {pitcher_id, name, name_norm, teams, pitches, levels, orgs}
+#   2: + current-club mapping (team, org, team_name, team_level, mlb_roster)
+#      and history lists reordered current-first
+_DIRECTORY_VERSION = 2
 
-def get_all_milb_pitchers(season, deadline=None):
+
+def _directory_key(season):
+    return f"{_MILB_CACHE_PREFIX}:directory:v{_DIRECTORY_VERSION}:{season}"
+
+
+def cached_milb_pitchers(season):
+    """The player pool as it stands in cache, or None. Never builds.
+
+    Lets a refresh diff old against new without paying for a ~200-request
+    sweep just to produce the "before" side.
+    """
+    season = int(season)
+    hit = _directory_cache.get(season)
+    if hit and (time.time() - hit[0]) < _DIRECTORY_TTL:
+        return hit[1]
+    return _l2_get_compressed(_directory_key(season))
+
+
+def get_all_milb_pitchers(season, deadline=None, refresh=False):
     """Every pitcher with a 2026 appearance at ANY level, for search.
 
     The Savant-derived directory only sees AAA + AFL (that is the whole pitch
@@ -947,17 +1000,26 @@ def get_all_milb_pitchers(season, deadline=None):
     last_date, levels, orgs}. `hand` and `last_date` are unavailable from
     season stats and come back None — the Savant list fills them in for AAA,
     and the client's ranking already tolerates nulls.
+
+    Every row is then stamped with the club the pitcher is on RIGHT NOW
+    (`team`/`org`/`team_name`), which is a transaction question the season
+    stats cannot answer: a player traded at the deadline keeps appearing under
+    the affiliate he last pitched for. See mlb_status.tag_current_team.
+
+    `refresh=True` skips both cache tiers and re-resolves every current club —
+    the trade-deadline rebuild.
     """
     from season import strip_accents
     season = int(season)
     now = time.time()
-    hit = _directory_cache.get(season)
-    if hit and (now - hit[0]) < _DIRECTORY_TTL:
-        return hit[1]
-    cached = _l2_get_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}")
-    if cached is not None:
-        _directory_cache[season] = (now, cached)
-        return cached
+    if not refresh:
+        hit = _directory_cache.get(season)
+        if hit and (now - hit[0]) < _DIRECTORY_TTL:
+            return hit[1]
+        cached = _l2_get_compressed(_directory_key(season))
+        if cached is not None:
+            _directory_cache[season] = (now, cached)
+            return cached
 
     from levels import affiliates_for_org, all_orgs
     affiliates = [m for org in all_orgs() for m in affiliates_for_org(org)]
@@ -1005,9 +1067,21 @@ def get_all_milb_pitchers(season, deadline=None):
                 entry["pitches"] += int(r.get("pitches") or 0)
 
     result = sorted(by_pitcher.values(), key=lambda r: r["name"])
+    # Map every pitcher to his CURRENT club before the pool is cached, so the
+    # ~45 people requests this costs are paid once by the nightly cron and
+    # never on a search. A failure here leaves the season history untouched.
+    try:
+        tag_current_team(result, refresh=refresh, deadline=deadline)
+        for row in result:
+            # The full club name is ~20 bytes x 4,500 players of payload the
+            # search UI never reads — it renders the abbreviation. Player pages
+            # get the name from their own (single-player) lookup.
+            row.pop("team_name", None)
+    except Exception as e:
+        print(f"[Directory] current-team tagging failed: {e}")
     if result:
         _directory_cache[season] = (now, result)
-        _l2_set_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}", result, _DIRECTORY_TTL)
+        _l2_set_compressed(_directory_key(season), result, _DIRECTORY_TTL)
     return result
 
 

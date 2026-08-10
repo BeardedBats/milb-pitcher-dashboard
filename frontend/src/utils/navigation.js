@@ -13,6 +13,25 @@
 //
 // Hash builders return the route WITHOUT the leading "#": callers prepend "#"
 // for href/pushState, and openHashInNewWindow adds it when constructing a URL.
+//
+// There is exactly ONE path route, /rehab, so the Rehab view can be linked and
+// shared. Everything else hangs off the home path, which is why every hash URL
+// and every "back to the games page" target is built from homePath() rather
+// than window.location.pathname — otherwise a link created while on /rehab
+// would inherit that path and land back on the Rehab view.
+// NOTE: /rehab only resolves in production because vercel.json rewrites it to
+// /index.html. A new path route needs a matching rewrite or it 404s.
+
+export const REHAB_PATH = "/rehab";
+
+export function homePath() {
+  const path = window.location.pathname || "/";
+  return path.replace(/\/rehab\/?$/i, "") || "/";
+}
+
+export function isRehabPath() {
+  return /\/rehab\/?$/i.test(window.location.pathname || "");
+}
 
 export function getHashParts(rawHash) {
   const hash = (rawHash || "").replace(/^#/, "");
@@ -65,7 +84,7 @@ export function openHashInNewWindow(hash) {
     window.electronAPI.openNewWindow(hash);
     return true;
   }
-  const url = window.location.origin + window.location.pathname + "#" + hash;
+  const url = window.location.origin + homePath() + "#" + hash;
   const a = document.createElement("a");
   a.href = url;
   a.target = "_blank";
@@ -90,7 +109,7 @@ export function openHashesInNewTabs(hashes) {
   // (see openHashInNewWindow): middle-click or Ctrl/Cmd+click keeps focus here;
   // a plain click follows the last tab.
   hashes.forEach(hash => {
-    const url = window.location.origin + window.location.pathname + "#" + hash;
+    const url = window.location.origin + homePath() + "#" + hash;
     const a = document.createElement("a");
     a.href = url;
     a.target = "_blank";

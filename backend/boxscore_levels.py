@@ -113,11 +113,12 @@ _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 #   2: initial derived rows (whiffs, CSW%, SwStr%, GB/FB/LD, Hard%) — shipped
 #      as a hand-written literal "rows:v2", which is why numbering starts here
 #   3: five metric families + per-hand splits
+#   4: avg_velo (feed startSpeed; None wherever the level isn't pitch-tracked)
 #
 # Note the near-miss: replacing the literal with a constant set to 2 produced a
 # byte-identical key and kept serving the very rows the bump was meant to
 # retire. A version bump is only real if the resulting key string changes.
-_METRICS_VERSION = 3
+_METRICS_VERSION = 4
 
 
 def _l2_get(key):
@@ -255,6 +256,10 @@ def _new_bucket():
         "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0,
         "soft": 0, "medium": 0, "hard": 0, "hardness_known": 0,
         "pull": 0, "center": 0, "oppo": 0, "spray_known": 0,
+        # Velocity carries a (sum, count) pair rather than a running mean so
+        # buckets stay mergeable and pitches without a reading don't drag the
+        # average toward zero.
+        "velo_sum": 0.0, "velo_count": 0,
     }
 
 
@@ -290,6 +295,9 @@ def _finalize(m):
     sk = m["spray_known"]
     return {
         "tracked_pitches": p,
+        # None (not 0.0) when nothing was tracked, so the UI shows a hyphen —
+        # the normal case below AAA, where the feed carries no startSpeed.
+        "avg_velo": round(m["velo_sum"] / m["velo_count"], 1) if m["velo_count"] else None,
         "whiffs": m["whiffs"],
         "called_strikes": m["called_strikes"],
         "swings": m["swings"],
@@ -333,17 +341,22 @@ def _finalize(m):
 def _derive_pitch_metrics(feed):
     """Per-pitcher pitch-level metrics from the play-by-play.
 
-    These levels have no Statcast — no velocity, pitch type or movement
-    (verified: startSpeed and details.type are absent on every pitch at every
-    level). But every pitch carries a CALL, a ball/strike COUNT, a batter
-    HANDEDNESS and a plate LOCATION, and every ball in play carries a
-    trajectory, hardness and fielder. That is enough for five metric families:
+    The non-Statcast levels this was written for have no pitch type or movement
+    (verified: startSpeed and details.type are absent on every pitch below AAA).
+    But every pitch carries a CALL, a ball/strike COUNT, a batter HANDEDNESS and
+    a plate LOCATION, and every ball in play carries a trajectory, hardness and
+    fielder. That is enough for five metric families:
 
         plate discipline  CSW%, SwStr%, Whiff%, Swing%, Contact%
         count             F-Strike%, 2Str%, PAR%
         zone              Zone%, O-Swing%, Z-Swing%, Z-Contact%, O-Contact%
         batted ball       GB/FB/LD/PU%, GB/FB
         contact quality   Soft/Med/Hard%, Pull/Center/Oppo%
+
+    `avg_velo` rides along for the callers that reach this function with a
+    pitch-tracked game (the Rehab view enriches AAA starts here): startSpeed is
+    read when the feed has it and left None when it doesn't, so the same code
+    path serves both without the caller having to know the level.
 
     Each family is also split by batter handedness into `splits.L` / `splits.R`.
 
@@ -420,9 +433,19 @@ def _derive_pitch_metrics(feed):
                 )
                 is_swing = code in _SWING_CODES
                 is_contact = code in _CONTACT_CODES
+                # Present at the pitch-tracked levels, absent below them. Read
+                # defensively: a single unparseable reading must not poison the
+                # whole game's average.
+                try:
+                    speed = float(pitch_data.get("startSpeed"))
+                except (TypeError, ValueError):
+                    speed = None
 
                 for m in buckets_for(current, bat_side):
                     m["tracked_pitches"] += 1
+                    if speed:
+                        m["velo_sum"] += speed
+                        m["velo_count"] += 1
                     if code in _WHIFF_CODES:
                         m["whiffs"] += 1
                     elif code in _CALLED_CODES:

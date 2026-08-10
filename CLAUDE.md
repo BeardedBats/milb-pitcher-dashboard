@@ -18,12 +18,13 @@ See BUILD-REPORT.md for what the fork changed and DECISIONS.md for why.
 - `backend/boxscore_levels.py` caches are two-tier (L1 dict + Redis via `_two_tier`). Cache DERIVED rows, never raw box scores — a full slate of raw payloads exceeds Upstash's per-request limit.
 - **Two cache versions, not one.** `CARD_SCHEMA_VERSION` (data.py) covers the daily agg keys; `_METRICS_VERSION` (boxscore_levels.py) covers the per-game derived rows and pitch metrics, which have a 30-day TTL and sit BEHIND the daily keys. Changing a derived-row shape and bumping only `CARD_SCHEMA_VERSION` makes the daily key miss, recompute, and read stale rows straight back out — bump BOTH. The box daily key encodes both (`daily_results_box_{level}_s{VER}m{METRICS}_{date}`) so they cannot desync. Two traps seen for real: a bump is only effective if the resulting key STRING changes (replacing a literal `v2` with a constant set to `2` is a no-op), and requesting a date during a partial rollout re-poisons the fresh key from the old cache.
 
-## Crons (9, in `vercel.json`)
+## Crons (9 scheduled, in `vercel.json`)
 Level-aware — the MLB originals assumed one slate a day.
 - Daily jobs run 07:00–08:20 UTC at 20-min spacing. Two constraints: each job does ~6x the work now, and 09:00 UTC is 5:00 AM EDT, exactly the `get_default_date()` rollover, where a job would warm the wrong slate.
 - `warmup-daily` loops all 6 levels under a deadline; `warmup-daily-cards` and both live crons are AAA+AFL only (no cards exist elsewhere).
 - `_final_game_pks_for_date` must never hardcode `sportId=1`.
 - Cron + `/api/materialize-*` endpoints fail CLOSED: unset `CRON_SECRET` means 401, not open.
+- `/api/cron/refresh-player-pool` is on-demand only (not in `vercel.json`) — same auth, run by hand after a trade deadline.
 
 ## Levels — the core concept
 `backend/levels.py` owns the level registry, the MLB parent-org map, and `(org, level)` team display names. Nothing else hardcodes a sportId.
@@ -32,6 +33,16 @@ Level-aware — the MLB originals assumed one slate a day.
 - **Level must be part of every date- or game-scoped cache key.** Existing keys: `games_{level}_{date}`, `schedule:{date}:{level}`, `daily_pitch_{level}_{date}`, `daily_results_{level}_s{VER}_{date}`, `daily_results_box_{level}_...`, `game_view_{level}_{date}_{pk}`, `range_day:{date}:lvlAAA-AFL:s{VER}`.
 - Player pages include ALL levels; game cards exist only for AAA + AFL; the player-page Savant table is AAA-only and is **omitted from the payload entirely** when a pitcher has no AAA games.
 - Current level = the level of the pitcher's LAST game. Never rosters, never active status.
+
+## The player pool — two different questions
+"Where did he pitch?" and "who does he belong to?" have different answers, and after a trade deadline they disagree for weeks. Keep them apart.
+- **Level/appearance history** comes from games. `current_level`, `levels`, and every stat on every page stay exactly as they are: last game played is the rule, rosters are never consulted.
+- **Current club** comes from the transaction feed — `currentTeam` on the MLB people record, resolved by `mlb_status.get_current_teams` / `tag_current_team`. This is the ONLY thing that flips on trade day; a traded prospect's last game stays with his old org until he takes the ball for the new one, and never moves at all if he's hurt.
+- The tagger sets `team`/`org`/`team_name`/`team_level` and reorders `teams`/`orgs`/`levels` **current-first without dropping history** — the old affiliate is still where those innings were thrown. A pitcher it cannot resolve is left untouched; a blank mapping must never overwrite a good one.
+- `team_level` is the level of the club he's on NOW — deliberately not named `current_level`. It is **absent** (not null) when he's on an MLB roster, where `mlb_roster: True` carries the fact instead. Never write `"MLB"` into a level field: `normalize_level` coerces anything unknown to AAA.
+- Directory rows drop `team_name` before caching — ~20 bytes x 4,500 players the search UI never reads. Same reason `hand`/`last_date` are omitted rather than nulled.
+- **Two directory versions, both needed.** `_DIRECTORY_VERSION` (boxscore_levels.py) keys the all-levels sweep; `PITCHER_DIR_VERSION` (data.py) keys BOTH `pitchers:v{N}:...` and `pitcher_dir:v{N}:...`. The latter **never expires**, so a shipped shape change without a bump serves the old pool forever. `clear_cache` indexes off the bare `pitchers:` prefix — keep it.
+- Refresh cadence: `warmup-daily-2` rebuilds nightly, `_DIRECTORY_TTL` and `_CURRENT_TEAM_TTL` are both 6h. Deadline day outruns that, so `/api/cron/refresh-player-pool` (cron-secret guarded) bypasses every tier and returns the actual org changes it found — verify a refresh, don't assume it.
 
 ## Savant minors endpoint — the one trap
 `/statcast-search-minors/csv` **requires `&minors=true`**. Without that flag it silently returns MAJOR-league rows and everything looks superficially fine. All three Savant URLs in `data.py` (`SAVANT_CSV_URL`, `SAVANT_RANGE_URL`, `SAVANT_PITCHER_SEASON_URL`) carry it. Minors gameTypes are only `R|PO`. `hfLevel` is left empty and rows are level-tagged from the schedules instead (`_apply_levels` / `_apply_levels_multi_date`).
@@ -107,7 +118,8 @@ MLB pitchers on an IL who have made a minor-league start in the last 14 days —
 ### Backend
 - `backend/app.py` — FastAPI endpoints: `/api/levels`, `/api/pitcher-card`, `/api/pitcher-season-totals`, `/api/player-page`, `/api/org-page`, `/api/game-linescore`, `/api/season-averages`, etc. Date-scoped endpoints take `level`.
 - `backend/levels.py` — Level registry (sportIds), per-level schedule URLs, MLB parent-org map, `(org, level)` team display. The ONLY place sportIds live.
-- `backend/boxscore_levels.py` — Box-score path for non-Statcast levels: `get_level_results` (adapted daily rows), `get_multi_level_game_log` (merged all-levels player log), `get_person_info`, `current_level`.
+- `backend/boxscore_levels.py` — Box-score path for non-Statcast levels: `get_level_results` (adapted daily rows), `get_multi_level_game_log` (merged all-levels player log), `get_person_info`, `current_level`, `get_all_milb_pitchers`/`cached_milb_pitchers` (the all-levels player pool).
+- `backend/mlb_status.py` — The three questions this app asks of the MLB side: `get_mlb_experience` (ever debuted), `get_il_pitchers` (on an IL now), `get_current_teams`/`tag_current_team` (which club he's on now — the player pool's team mapping).
 - `backend/aggregation.py` — Data aggregation: `get_pitcher_card`, `get_pitcher_game_log`, `aggregate_pitch_data_range`, `_aggregate_pitch_df`. `_filter_level` slices a day's frame to one level.
 - `backend/data.py` — Data fetching, caching, boxscore lookups, level tagging (`_apply_levels`, `_apply_levels_multi_date`, `get_game_level_map`).
 - `backend/season.py` — Shared constants + pure helpers: `SEASON_START`/`season_start(year)`, `now_et()`, `strip_accents()`, `ip_to_outs()` (single IP parser), `aggregate_game_log_to_totals()` (single copy of season-totals math). Stdlib-only — importable from anywhere without cycles.

@@ -1265,7 +1265,7 @@ canvas { display: block; border: none; border-radius: var(--radius-sm); }
 .search-result:hover, .search-result.highlighted { background: var(--hover-tint); }
 
 .search-result-name { color: var(--name); font-weight: 600; font-size: 13px; }
-.search-result-meta { color: var(--text-dim); font-size: 12px; }
+.search-result-meta { color: var(--text-dim); font-size: 12px; white-space: nowrap; padding-left: 12px; }
 .search-no-results { color: var(--text-dim); font-size: 13px; justify-content: center; cursor: default; }
 
 /* ======== PAGE LAYOUT (shared for Leaderboard, Team pages) ======== */

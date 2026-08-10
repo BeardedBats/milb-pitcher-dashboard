@@ -18,6 +18,7 @@ CRON_PATHS = [
     "/api/cron/stat-corrections",
     "/api/cron/warmup-daily",
     "/api/cron/warmup-daily-2",
+    "/api/cron/refresh-player-pool",
     "/api/cron/warmup-daily-players",
     "/api/cron/warmup-daily-cards",
     "/api/cron/warmup-live-cards",

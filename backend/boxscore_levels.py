@@ -22,6 +22,7 @@ from levels import (
     DEFAULT_LEVEL, LEVEL_ORDER, LEVELS, normalize_level, org_for_team,
     team_display_name, team_meta_by_id,
 )
+from mlb_status import tag_current_team
 
 _BOXSCORE_URL = "https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
 # The live feed carries the box score AND the play-by-play in one response, so
@@ -955,8 +956,37 @@ def enrich_log_with_pitch_metrics(rows, pitcher_id, deadline=None, max_fetch=25)
 _DIRECTORY_TTL = 6 * 3600
 _directory_cache = {}  # { season: (timestamp, rows) }
 
+# BUMP THIS whenever a directory row gains, loses or changes a field.
+#
+# The directory is the player pool the search bar loads once and filters
+# locally, so a shape change that doesn't move the key string just serves the
+# old shape until the TTL happens to lapse — six hours of a half-deployed
+# player pool. Same rule as _METRICS_VERSION: the bump is only real if the
+# resulting key STRING changes.
+#   1: {pitcher_id, name, name_norm, teams, pitches, levels, orgs}
+#   2: + current-club mapping (team, org, team_name, team_level, mlb_roster)
+#      and history lists reordered current-first
+_DIRECTORY_VERSION = 2
 
-def get_all_milb_pitchers(season, deadline=None):
+
+def _directory_key(season):
+    return f"{_MILB_CACHE_PREFIX}:directory:v{_DIRECTORY_VERSION}:{season}"
+
+
+def cached_milb_pitchers(season):
+    """The player pool as it stands in cache, or None. Never builds.
+
+    Lets a refresh diff old against new without paying for a ~200-request
+    sweep just to produce the "before" side.
+    """
+    season = int(season)
+    hit = _directory_cache.get(season)
+    if hit and (time.time() - hit[0]) < _DIRECTORY_TTL:
+        return hit[1]
+    return _l2_get_compressed(_directory_key(season))
+
+
+def get_all_milb_pitchers(season, deadline=None, refresh=False):
     """Every pitcher with a 2026 appearance at ANY level, for search.
 
     The Savant-derived directory only sees AAA + AFL (that is the whole pitch
@@ -970,17 +1000,26 @@ def get_all_milb_pitchers(season, deadline=None):
     last_date, levels, orgs}. `hand` and `last_date` are unavailable from
     season stats and come back None — the Savant list fills them in for AAA,
     and the client's ranking already tolerates nulls.
+
+    Every row is then stamped with the club the pitcher is on RIGHT NOW
+    (`team`/`org`/`team_name`), which is a transaction question the season
+    stats cannot answer: a player traded at the deadline keeps appearing under
+    the affiliate he last pitched for. See mlb_status.tag_current_team.
+
+    `refresh=True` skips both cache tiers and re-resolves every current club —
+    the trade-deadline rebuild.
     """
     from season import strip_accents
     season = int(season)
     now = time.time()
-    hit = _directory_cache.get(season)
-    if hit and (now - hit[0]) < _DIRECTORY_TTL:
-        return hit[1]
-    cached = _l2_get_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}")
-    if cached is not None:
-        _directory_cache[season] = (now, cached)
-        return cached
+    if not refresh:
+        hit = _directory_cache.get(season)
+        if hit and (now - hit[0]) < _DIRECTORY_TTL:
+            return hit[1]
+        cached = _l2_get_compressed(_directory_key(season))
+        if cached is not None:
+            _directory_cache[season] = (now, cached)
+            return cached
 
     from levels import affiliates_for_org, all_orgs
     affiliates = [m for org in all_orgs() for m in affiliates_for_org(org)]
@@ -1028,9 +1067,21 @@ def get_all_milb_pitchers(season, deadline=None):
                 entry["pitches"] += int(r.get("pitches") or 0)
 
     result = sorted(by_pitcher.values(), key=lambda r: r["name"])
+    # Map every pitcher to his CURRENT club before the pool is cached, so the
+    # ~45 people requests this costs are paid once by the nightly cron and
+    # never on a search. A failure here leaves the season history untouched.
+    try:
+        tag_current_team(result, refresh=refresh, deadline=deadline)
+        for row in result:
+            # The full club name is ~20 bytes x 4,500 players of payload the
+            # search UI never reads — it renders the abbreviation. Player pages
+            # get the name from their own (single-player) lookup.
+            row.pop("team_name", None)
+    except Exception as e:
+        print(f"[Directory] current-team tagging failed: {e}")
     if result:
         _directory_cache[season] = (now, result)
-        _l2_set_compressed(f"{_MILB_CACHE_PREFIX}:directory:{season}", result, _DIRECTORY_TTL)
+        _l2_set_compressed(_directory_key(season), result, _DIRECTORY_TTL)
     return result
 
 

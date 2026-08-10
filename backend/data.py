@@ -185,8 +185,22 @@ STAT_LINES_REFRESH_PREFIX = "stat_lines_refresh"
 RANGE_DAY_PREFIX = "range_day"
 CACHE_INDEX_PREFIX = "cacheidx"
 MATERIALIZE_PENDING_KEY = "materialize:pending"
-RANGE_DAY_TTL = 60 * 60 * 24 * 60
-CACHE_INDEX_TTL = 60 * 60 * 24 * 30
+# Per-day snapshot lifetime. This MUST outlast a full season. A season-scoped
+# range is "materialized" only when EVERY day in it is still present, so a TTL
+# shorter than the season guarantees the earliest days expire while the season
+# is still being played and the range can never once be complete. At 60 days
+# that is exactly what happened: by August the March and April snapshots were
+# gone, so /api/org-page never upgraded AAA to Statcast columns and the
+# materialize cron re-baked a perpetually expiring tail. 400 days spans a full
+# season (late March through AFL in November, ~250 days) with room to spare,
+# at the cost of holding a season of compressed snapshots in Upstash.
+RANGE_DAY_TTL = 60 * 60 * 24 * 400
+# The cache index is what date-scoped invalidation walks to find a day's
+# snapshot (_delete_indexed("date", ...)). It must never expire BEFORE the keys
+# it indexes, or invalidating an old date silently no-ops and the stale
+# snapshot survives to its own much longer TTL. Index entries are just key
+# names, so matching the longest indexed lifetime is cheap.
+CACHE_INDEX_TTL = RANGE_DAY_TTL
 MATERIALIZE_STATUS_TTL = 60 * 60 * 24
 
 
@@ -1518,7 +1532,7 @@ def get_range_materialization_status(start_date, end_date):
     status = redis_get(_materialize_status_key(start_date, end_date))
     if status:
         return status
-    if fetch_date_range_materialized(start_date, end_date) is not None:
+    if range_is_materialized(start_date, end_date):
         return {"status": "ready"}
     if not redis_available():
         return {"status": "error", "error": "Season cache rebuild is unavailable because Redis is not configured."}
@@ -1526,7 +1540,9 @@ def get_range_materialization_status(start_date, end_date):
 
 
 def queue_range_materialization(start_date, end_date):
-    if fetch_date_range_materialized(start_date, end_date) is not None:
+    # Runs on every 202 (_loading_response -> here), so this check must stay
+    # cheap — it used to load the whole season to answer "is it ready?".
+    if range_is_materialized(start_date, end_date):
         redis_set(_materialize_status_key(start_date, end_date), {"status": "ready"}, ttl=MATERIALIZE_STATUS_TTL)
         return {"status": "ready", "queued": False}
     if not redis_available():
@@ -1682,6 +1698,13 @@ def _load_range_day(date_str):
 
 
 def _load_persisted_range(start_date, end_date):
+    # QUARANTINED — builds the whole range as one DataFrame. NO CALLERS outside
+    # fetch_date_range / fetch_date_range_materialized, which are themselves
+    # callerless. Over a season that frame is ~612k rows / ~1.3 GB against a
+    # 3009 MB limit. Use fold_range_materialized (day at a time),
+    # fetch_pitcher_rows_materialized (one pitcher) or range_is_materialized
+    # (just the boolean). Pinned by tests/test_no_season_frame_on_request_paths.
+    #
     # Per-key GETs. We tried batching with MGET (commit 3343975) to cut
     # Upstash command volume, but Upstash's REST response size cap (~5 MB)
     # means an MGET on even 2-3 full regular-season days raises — and the
@@ -1871,6 +1894,9 @@ def _merge_daily_cache(df, start_date, end_date):
 
 
 def fetch_date_range(start_date, end_date):
+    # QUARANTINED — see _load_persisted_range. NO CALLERS: this fetches and
+    # concatenates the league's whole season. warmup_range_data used to call it
+    # and now sweeps fetch_date(day) one day at a time instead.
     """Fetch all pitches across a date range from Savant, supplemented with daily cache."""
     cache_key = (start_date, end_date)
     if cache_key in _range_cache:
@@ -1910,7 +1936,9 @@ def fetch_date_range(start_date, end_date):
 
 
 def fetch_date_range_materialized(start_date, end_date):
-    """Return a range DataFrame only from L1/Redis materialized data.
+    """QUARANTINED — see _load_persisted_range. NO CALLERS.
+
+    Return a range DataFrame only from L1/Redis materialized data.
     Returns None when the range is not fully materialized, so user-facing
     endpoints can avoid synchronous Savant range recomputes."""
     cache_key = (start_date, end_date)
@@ -1934,6 +1962,57 @@ def fetch_date_range_materialized(start_date, end_date):
             persisted = persisted.drop_duplicates(subset=["game_pk", "at_bat_number", "pitch_number"], keep="first")
     _range_cache[cache_key] = (time.time(), persisted)
     return _merge_daily_cache(persisted, start_date, end_date)
+
+
+def fetch_pitcher_rows_materialized(pitcher_id, start_date, end_date):
+    """One pitcher's rows across a materialized range, without the league frame.
+
+    Same contract as fetch_date_range_materialized (None when a day is not
+    baked) but it folds day by day and keeps only this pitcher's rows, so peak
+    memory is one day plus one pitcher's season — a few thousand rows rather
+    than ~612k. Concatenating at the end is safe precisely because the filter
+    has already run.
+    """
+    try:
+        pid = int(pitcher_id)
+    except (TypeError, ValueError):
+        return pd.DataFrame()
+
+    mine = []
+
+    def fold(day_df):
+        if "pitcher" not in day_df.columns:
+            return
+        rows = day_df[day_df["pitcher"] == pid]
+        if not rows.empty:
+            mine.append(rows)
+
+    if not fold_range_materialized(start_date, end_date, fold):
+        return None
+    return pd.concat(mine, ignore_index=True) if mine else pd.DataFrame()
+
+
+def range_is_materialized(start_date, end_date):
+    """Is this range fully baked? Answers the QUESTION without loading the data.
+
+    Three callers only ever needed the boolean and were calling
+    fetch_date_range_materialized for it, throwing away a whole season of
+    decompressed Statcast to learn one bit. One of them
+    (queue_range_materialization) runs on EVERY 202, which made "not ready yet"
+    the single most expensive answer the backend could give.
+
+    Cheap path first: if the marker set names a missing day, confirm that day
+    with one real GET (the set can under-report). Otherwise fall back to EXISTS
+    probes, stopping at the first hole, because the set can also over-report
+    days whose snapshots have expired.
+    """
+    persisted_end = _previous_date(end_date) if _is_today(end_date) else end_date
+    if persisted_end < start_date:
+        return True  # nothing but today in the window; today is always live
+    probably_missing = missing_range_days(start_date, persisted_end)
+    if probably_missing and _load_range_day(probably_missing[0]) is None:
+        return False
+    return not unbaked_range_days(start_date, persisted_end, limit=1)
 
 
 # Membership set of days that have a baked range_day snapshot.
@@ -2619,7 +2698,8 @@ def warmup_range_data(start_date=SEASON_START, end_date=None):
     # silently skipping team warming.
     from aggregation import (
         aggregate_pitch_data, aggregate_pitcher_results,
-        aggregate_pitch_data_range, aggregate_pitcher_results_range,
+        new_results_accumulator, accumulate_pitcher_results, finalize_pitcher_results,
+        new_pitch_data_accumulator, accumulate_pitch_data, finalize_pitch_data,
     )
 
     print(f"[Warmup] Starting data pre-fetch: {start_date} to {end_date}")
@@ -2651,39 +2731,81 @@ def warmup_range_data(start_date=SEASON_START, end_date=None):
             print(f"[Warmup] Default date warm failed: {e2}")
 
         # 2) BEST-EFFORT season-wide warming, bounded by the deadline.
+        #
+        # One day at a time. This used to call fetch_date_range(start, end),
+        # which assembles the league's entire season — ~612k rows, on the order
+        # of 1.3 GB — inside a job that also runs on Vercel via
+        # /api/cron/warmup. fetch_date fetches AND persists a single day's
+        # snapshot, so the same caches get warmed; the season just never exists
+        # as one object. Boxscores are prefetched per day and team totals go
+        # through the streaming accumulators.
         with _warmup_lock:
             _warmup_status["progress"] = "Fetching pitch data from Savant..."
-        df = fetch_date_range(start_date, end_date)
-        elapsed = time.time() - t0
-        print(f"[Warmup] Savant data loaded: {len(df)} rows in {elapsed:.1f}s")
 
-        if not df.empty and time.time() < deadline:
+        results_acc = {}
+        pitch_acc = {}
+        days_seen = 0
+        rows_seen = 0
+        swept_whole_range = True
+
+        for date_str in _date_strings(start_date, end_date):
+            if time.time() >= deadline:
+                swept_whole_range = False
+                break
+            try:
+                day_df = fetch_date(date_str)
+            except Exception as day_err:
+                # One bad day must not abandon the sweep, but it does mean the
+                # range is no longer fully covered.
+                print(f"[Warmup] {date_str} failed: {day_err}")
+                swept_whole_range = False
+                continue
+            if day_df is None or day_df.empty:
+                continue
+            days_seen += 1
+            rows_seen += len(day_df)
+
             with _warmup_lock:
-                _warmup_status["progress"] = "Pre-fetching boxscore data..."
-            prefetch_boxscores(df)
+                _warmup_status["progress"] = f"Warming {date_str} ({days_seen} days)..."
+            prefetch_boxscores(day_df, deadline=deadline)
 
-            # Pre-compute per-team aggregations so team pages load instantly.
-            if "pitcher_team" in df.columns:
-                with _warmup_lock:
-                    _warmup_status["progress"] = "Pre-computing team aggregations..."
-                teams = df["pitcher_team"].dropna().unique()
-                warmed = 0
-                for team in teams:
-                    if time.time() >= deadline:
-                        print(f"[Warmup] Deadline hit - cached {warmed}/{len(teams)} teams, deferring rest")
-                        break
-                    tdf = df[df["pitcher_team"] == team]
+            if "pitcher_team" in day_df.columns:
+                for team, tdf in day_df.groupby("pitcher_team"):
                     if tdf.empty:
                         continue
-                    t_results = aggregate_pitcher_results_range(tdf)
-                    set_agg_cache(f"team_{team}_results_{start_date}_{end_date}", t_results)
-                    t_pitch = aggregate_pitch_data_range(tdf)
-                    set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}", t_pitch)
-                    warmed += 1
-                else:
-                    print(f"[Warmup] Team aggregations cached for {len(teams)} teams")
-        elif not df.empty:
-            print("[Warmup] Deadline hit before season-wide warming - homepage caches warm, deferring rest")
+                    if team not in results_acc:
+                        results_acc[team] = new_results_accumulator()
+                        pitch_acc[team] = new_pitch_data_accumulator()
+                    accumulate_pitcher_results(results_acc[team], tdf)
+                    accumulate_pitch_data(pitch_acc[team], tdf)
+            del day_df
+
+        elapsed = time.time() - t0
+        print(f"[Warmup] Savant data loaded: {rows_seen} rows across {days_seen} dates in {elapsed:.1f}s")
+
+        # A team aggregation is only correct over the WHOLE range. The old code
+        # got that for free by loading the full range before aggregating and
+        # breaking per team; streaming means a deadline can cut the sweep
+        # mid-season, and caching those accumulators would publish a silently
+        # short stat line for every team. So: all days, or no team writes.
+        if not swept_whole_range:
+            print("[Warmup] Deadline hit during the season sweep - homepage caches warm, "
+                  "deferring team aggregations rather than caching partial totals")
+        elif results_acc:
+            with _warmup_lock:
+                _warmup_status["progress"] = "Pre-computing team aggregations..."
+            warmed = 0
+            for team in list(results_acc):
+                if time.time() >= deadline:
+                    print(f"[Warmup] Deadline hit - cached {warmed}/{len(results_acc)} teams, deferring rest")
+                    break
+                set_agg_cache(f"team_{team}_results_{start_date}_{end_date}",
+                              finalize_pitcher_results(results_acc[team]))
+                set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}",
+                              finalize_pitch_data(pitch_acc[team]))
+                warmed += 1
+            else:
+                print(f"[Warmup] Team aggregations cached for {len(results_acc)} teams")
 
         elapsed_total = time.time() - t0
         print(f"[Warmup] Complete in {elapsed_total:.1f}s")

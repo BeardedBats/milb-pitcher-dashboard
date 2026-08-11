@@ -24,8 +24,9 @@ from season import (
 from data import (
     get_games, clear_cache, clear_live_refresh_cache, get_default_date, get_game_linescore,
     save_pitch_override, remove_pitch_override, get_all_overrides,
-    fetch_date_range, prefetch_boxscores,
-    fetch_date_range_materialized, fold_range_materialized,
+    prefetch_boxscores,
+    fold_range_materialized, range_is_materialized,
+    fetch_pitcher_rows_materialized,
     fetch_all_pitchers_list_materialized,
     fetch_pitchers_directory,
     queue_range_materialization, get_range_materialization_status,
@@ -42,8 +43,7 @@ from data import (
 )
 from aggregation import (
     aggregate_pitch_data, aggregate_pitcher_results, get_pitcher_card,
-    get_season_averages, aggregate_pitcher_results_range,
-    aggregate_pitch_data_range, get_pitcher_game_log,
+    get_season_averages, get_pitcher_game_log,
     find_previous_mlb_season,
     new_results_accumulator, accumulate_pitcher_results, finalize_pitcher_results,
     new_pitch_data_accumulator, accumulate_pitch_data, finalize_pitch_data,
@@ -282,8 +282,8 @@ def pitcher_results(
         if cached is not None:
             return tag_mlb_experience(cached)
         # include_season_context drives the velo/ext deltas + opener-swap
-        # detection. Both internal helpers now use fetch_date_range_materialized
-        # so this is safe to keep on (no Savant CSV roundtrips).
+        # detection. Both internal helpers read only already-materialized
+        # per-day data, so this is safe to keep on (no Savant CSV roundtrips).
         result = tag_mlb_experience(aggregate_pitcher_results(date, game_pk, include_season_context=True, level=level))
         # Don't cache a degraded payload — if the materialized range was missing
         # when this aggregation ran, every row's velo_season / *_delta is null.
@@ -541,7 +541,7 @@ def _fetch_pitcher_season_window(pitcher_id, start_date, end_date):
     return df
 
 
-def _compute_season_totals(pitcher_id, start_date, end_date, preloaded_df=None, materialized_only=False):
+def _compute_season_totals(pitcher_id, start_date, end_date, preloaded_df=None):
     """Compute season totals for a pitcher. Returns dict or {} if no data."""
     suffix = _season_cache_suffix(start_date, end_date)
     agg_key = f"season_totals_{pitcher_id}_s{CARD_SCHEMA_VERSION}{suffix}"
@@ -550,7 +550,7 @@ def _compute_season_totals(pitcher_id, start_date, end_date, preloaded_df=None, 
         return cached
     if preloaded_df is not None and not preloaded_df.empty:
         df = preloaded_df
-    elif materialized_only:
+    else:
         # Per-pitcher fast path FIRST: one pitcher's totals must never require
         # assembling the whole league's season DataFrame (78+ range_day reads
         # + pd.concat — the main serverless OOM driver). fetch_pitcher_season
@@ -560,13 +560,12 @@ def _compute_season_totals(pitcher_id, start_date, end_date, preloaded_df=None, 
         df = _fetch_pitcher_season_window(pitcher_id, start_date, end_date)
         if df is None:
             # Rare fallback (per-pitcher fetch failed or pitcher has no rows):
-            # read the already-materialized league range. Never triggers a
-            # Savant league fetch — returns None when not materialized.
-            df = fetch_date_range_materialized(start_date, end_date)
-            if df is None:
-                return {}
-    else:
-        df = fetch_date_range(start_date, end_date)
+            # read this pitcher's rows out of the already-baked range, still a
+            # day at a time. Never a league-wide Savant fetch, and returns None
+            # when the range is not materialized.
+            df = fetch_pitcher_rows_materialized(pitcher_id, start_date, end_date)
+        if df is None:
+            return {}
     if df.empty:
         return {}
     game_log = get_pitcher_game_log(df, pitcher_id)
@@ -576,7 +575,7 @@ def _compute_season_totals(pitcher_id, start_date, end_date, preloaded_df=None, 
     return result
 
 
-def _compute_mlb_full_season_totals(pitcher_id, season_year, preloaded_df=None, materialized_only=False):
+def _compute_mlb_full_season_totals(pitcher_id, season_year, preloaded_df=None):
     """MLB-only season totals (existing Statcast-based path)."""
     season_start = _season_start(season_year)
     end_date = _resolve_end_date("")
@@ -585,7 +584,6 @@ def _compute_mlb_full_season_totals(pitcher_id, season_year, preloaded_df=None, 
         season_start,
         end_date,
         preloaded_df=preloaded_df,
-        materialized_only=materialized_only,
     )
 
 
@@ -838,7 +836,6 @@ def _build_pitcher_card_payload(date_str, pitcher_id, game_pk):
             pitcher_id,
             season_year,
             preloaded_df=pitcher_df,
-            materialized_only=True,
         )
     else:
         # Per-pitcher Savant returned no data — degrade rather than trigger a
@@ -963,10 +960,14 @@ def _build_player_page_payload(pitcher_id, start_date, end_date, preloaded_df=No
     }
     if preloaded_df is not None:
         df = preloaded_df
-    elif pitcher_season_fallback:
-        df = _fetch_pitcher_season_window(pitcher_id, start_date, end_date)
     else:
-        df = fetch_date_range(start_date, end_date)
+        # Per-pitcher, never the league. This used to fall back to
+        # fetch_date_range(start, end) — a whole-season LIVE Savant pull to
+        # render one player's page. No caller reaches that today (every one
+        # passes preloaded_df or pitcher_season_fallback), which is exactly why
+        # it was a landmine rather than an outage: it would have gone off the
+        # first time someone added a caller without one of those.
+        df = _fetch_pitcher_season_window(pitcher_id, start_date, end_date)
     # Spec: the player page's Savant data table is AAA ONLY. fetch_* returns
     # every Statcast level, so AFL rows are dropped here before any pitch
     # summary is computed — otherwise a fall-league outing would quietly land
@@ -1042,7 +1043,6 @@ def _build_player_page_payload(pitcher_id, start_date, end_date, preloaded_df=No
         pitcher_id,
         season_year,
         preloaded_df=df if pitcher_season_fallback else preloaded_df,
-        materialized_only=(preloaded_df is not None or pitcher_season_fallback),
     )
     result["season_totals_mlb"] = totals
     result["season_totals"] = totals  # backward compat
@@ -1128,6 +1128,22 @@ def _pitcher_half_inning_settled(game_pk, pitcher_id):
     return False
 
 
+def _collect_past_game_triples(df, pid_set, today, out):
+    """Add (pitcher, game_date, game_pk) for these pitchers' games BEFORE today.
+
+    Written to be called either on one day's frame (the streaming path) or on a
+    whole preloaded frame — it only ever reads three columns and appends to a
+    set, so both give the same result.
+    """
+    if df is None or df.empty:
+        return
+    if not {"pitcher", "game_date", "game_pk"}.issubset(df.columns):
+        return
+    rows = df[df["pitcher"].isin(pid_set) & (df["game_date"].astype(str) < today)]
+    for pid, game_date, game_pk in zip(rows["pitcher"], rows["game_date"], rows["game_pk"]):
+        out.add((int(pid), str(game_date)[:10], int(game_pk)))
+
+
 def _rewarm_past_cards_for_pitchers(pitcher_ids, today, season_df=None, deadline=None):
     """Rebuild card_* entries for these pitchers' PRIOR games.
 
@@ -1145,36 +1161,43 @@ def _rewarm_past_cards_for_pitchers(pitcher_ids, today, season_df=None, deadline
     if not pid_set:
         return {"warmed": 0, "skipped": 0, "budget_hit": False}
 
-    if season_df is None:
+    # All this needs from the season is three columns for a handful of
+    # pitchers. It used to materialize the entire league's season frame to get
+    # them; now the no-preloaded-frame path folds day by day and keeps only the
+    # matching (pitcher, date, game) triples, so nothing scales with league
+    # size. A game_pk belongs to exactly one game_date, so per-day collection
+    # into a set dedupes identically to the old drop_duplicates.
+    triples = set()
+    if season_df is not None:
+        if season_df.empty or "pitcher" not in season_df.columns:
+            return {"warmed": 0, "skipped": len(pid_set), "budget_hit": False}
+        _collect_past_game_triples(season_df, pid_set, today, triples)
+    else:
         season_start = _season_start(today[:4])
         season_end = _resolve_end_date("")
-        season_df = fetch_date_range_materialized(season_start, season_end)
-    if season_df is None or season_df.empty or "pitcher" not in season_df.columns:
-        return {"warmed": 0, "skipped": len(pid_set), "budget_hit": False}
+        complete = fold_range_materialized(
+            season_start, season_end,
+            lambda day_df: _collect_past_game_triples(day_df, pid_set, today, triples),
+        )
+        if not complete:
+            return {"warmed": 0, "skipped": len(pid_set), "budget_hit": False}
 
-    past_df = season_df[
-        season_df["pitcher"].isin(pid_set)
-        & (season_df["game_date"].astype(str) < today)
-    ]
-    if past_df.empty:
+    if not triples:
         return {"warmed": 0, "skipped": 0, "budget_hit": False}
 
-    pairs = (
-        past_df[["pitcher", "game_date", "game_pk"]]
-        .drop_duplicates()
-        .sort_values(["game_date", "pitcher"], ascending=[False, True])
-    )
+    # game_date DESC, then pitcher ASC — same order the old sort_values gave.
+    # Python's sort is stable, so the secondary key is applied first. game_pk
+    # is in the minor key purely to keep the order deterministic.
+    ordered = sorted(triples, key=lambda t: (t[0], t[2]))
+    ordered.sort(key=lambda t: t[1], reverse=True)
 
     warmed = 0
     skipped = 0
     budget_hit = False
-    for _, row in pairs.iterrows():
+    for pid, game_date, gpk in ordered:
         if deadline is not None and time.time() > deadline:
             budget_hit = True
             break
-        pid = int(row["pitcher"])
-        game_date = str(row["game_date"])[:10]
-        gpk = int(row["game_pk"])
         agg_key = f"card_{game_date}_{pid}_{gpk}_v{get_override_version()}_s{CARD_SCHEMA_VERSION}"
         if get_agg_cache(agg_key) is not None:
             skipped += 1
@@ -1225,10 +1248,13 @@ def pitcher_season_totals(response: Response, pitcher_id: int = Query(...), star
     """Return aggregated season totals for a pitcher's box score row."""
     end_date = _resolve_end_date(end_date)
     _set_response_cache(response, _cache_scope_for_date(end_date))
-    result = _compute_season_totals(pitcher_id, start_date, end_date, materialized_only=True)
+    result = _compute_season_totals(pitcher_id, start_date, end_date)
     if result:
         return result
-    if fetch_date_range_materialized(start_date, end_date) is None:
+    # Only the boolean matters here — "is the range baked, or should the client
+    # be told to wait?". Loading the season to decide that was the expensive way
+    # to say "no".
+    if not range_is_materialized(start_date, end_date):
         return _loading_response(response, start_date, end_date)
     return {}
 
@@ -2032,26 +2058,43 @@ def cron_warmup_daily_season(request: Request, response: Response):
         deadline = time.time() + 260
         start_date = _season_start(_now_et().year)
         end_date = _resolve_end_date("")
-        df = fetch_date_range_materialized(start_date, end_date)
-        if df is None:
+        # Per-affiliate AAA team aggregations (same shape as the MLB app's).
+        #
+        # Streamed a day at a time with one accumulator per team, rather than
+        # materializing the league's whole season and slicing it ~30 ways. The
+        # accumulators are equivalence-tested against the aggregate_*_range
+        # functions this replaces (backend/tests/test_streaming_range_agg.py),
+        # so the cached payloads are byte-for-byte what they were.
+        # groupby drops NaN keys, matching the old dropna() on the team column.
+        results_acc = {}
+        pitch_acc = {}
+
+        def fold(day_df):
+            if "pitcher_team" not in day_df.columns:
+                return
+            for team, tdf in day_df.groupby("pitcher_team"):
+                if tdf.empty:
+                    continue
+                if team not in results_acc:
+                    results_acc[team] = new_results_accumulator()
+                    pitch_acc[team] = new_pitch_data_accumulator()
+                accumulate_pitcher_results(results_acc[team], tdf)
+                accumulate_pitch_data(pitch_acc[team], tdf)
+
+        if not fold_range_materialized(start_date, end_date, fold):
             # Range not materialized yet — queue it and let the materialize
             # cron pick it up rather than doing a blocking season fetch here.
             queue_range_materialization(start_date, end_date)
             return {"status": "deferred", "reason": "range not materialized",
                     "start_date": start_date, "end_date": end_date}
 
-        # Per-affiliate AAA team aggregations (same shape as the MLB app's).
-        if "pitcher_team" in df.columns:
-            for team in df["pitcher_team"].dropna().unique():
-                if time.time() >= deadline:
-                    break
-                tdf = df[df["pitcher_team"] == team]
-                if tdf.empty:
-                    continue
-                set_agg_cache(f"team_{team}_results_{start_date}_{end_date}",
-                              aggregate_pitcher_results_range(tdf))
-                set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}",
-                              aggregate_pitch_data_range(tdf))
+        for team in list(results_acc):
+            if time.time() >= deadline:
+                break
+            set_agg_cache(f"team_{team}_results_{start_date}_{end_date}",
+                          finalize_pitcher_results(results_acc[team]))
+            set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}",
+                          finalize_pitch_data(pitch_acc[team]))
 
         warmed_orgs, skipped_orgs = [], []
         season_year = int(start_date[:4])

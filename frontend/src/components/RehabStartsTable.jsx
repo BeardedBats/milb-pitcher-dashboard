@@ -54,6 +54,8 @@ function monthDay(iso) {
 export default function RehabStartsTable({
   data,
   onPitcherClick,
+  onGameClick,
+  isCardLevel,
   hiddenCols = REHAB_DEFAULT_HIDDEN,
   sortKey = "date",
   onSortKeyChange,
@@ -134,8 +136,28 @@ export default function RehabStartsTable({
         </tr>
       </thead>
       <tbody>
-        {sorted.map(row => (
-          <tr key={`${row.pitcher_id}-${row.game_pk}`}>
+        {sorted.map(row => {
+          // Clicking a row opens that game's card — but cards only exist for
+          // the pitch-tracked levels. /api/pitcher-card answers {} for an
+          // AA/A+/A/R game, so those rows must NOT look clickable: this view
+          // deliberately spans every level, so most slates have both kinds.
+          // The pitcher name still opens the player page on every row.
+          const canOpenGame = Boolean(
+            onGameClick && row.game_pk && row.date &&
+            (isCardLevel ? isCardLevel(row.level) : row.level === "AAA" || row.level === "AFL")
+          );
+          const openGame = (e) => { if (canOpenGame) onGameClick(row.date, row.pitcher_id, row.game_pk, e); };
+          return (
+          <tr
+            key={`${row.pitcher_id}-${row.game_pk}`}
+            className={canOpenGame ? "clickable-row" : undefined}
+            title={canOpenGame ? undefined : `No game card at ${row.level} — pitch data is AAA/AFL only`}
+            onClick={canOpenGame ? openGame : undefined}
+            // Middle-click opens in a new tab. preventDefault on mousedown
+            // stops the browser's autoscroll widget from appearing first.
+            onMouseDown={canOpenGame ? (e) => { if (e.button === 1) e.preventDefault(); } : undefined}
+            onAuxClick={canOpenGame ? (e) => { if (e.button === 1) { e.preventDefault(); openGame(e); } } : undefined}
+          >
             {columns.map(c => {
               if (c.key === "date") {
                 return (
@@ -153,7 +175,12 @@ export default function RehabStartsTable({
                         className="pitcher-link rehab-pitcher mlb-exp"
                         role="button"
                         tabIndex={0}
-                        onClick={(e) => onPitcherClick(row.pitcher_id, e)}
+                        // Name goes to the player page; the row goes to the
+                        // game. Without stopPropagation the row handler would
+                        // fire too and the game card would win.
+                        onClick={(e) => { e.stopPropagation(); onPitcherClick(row.pitcher_id, e); }}
+                        onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }}
+                        onAuxClick={(e) => { if (e.button === 1) e.stopPropagation(); }}
                       >
                         {row.pitcher}
                       </span>
@@ -185,7 +212,8 @@ export default function RehabStartsTable({
               );
             })}
           </tr>
-        ))}
+          );
+        })}
       </tbody>
     </table>
   );

@@ -27,7 +27,7 @@ from data import (
     prefetch_boxscores,
     fold_range_materialized, range_is_materialized,
     fetch_pitcher_rows_materialized,
-    fetch_all_pitchers_list_materialized,
+    fetch_all_pitchers_list_materialized, warm_partial_pitcher_directory,
     fetch_pitchers_directory,
     queue_range_materialization, get_range_materialization_status,
     drain_pending_materializations,
@@ -2030,7 +2030,14 @@ def cron_warmup_daily(request: Request, response: Response):
         try:
             sl_start = _season_start(_now_et().year)
             totals_end = _resolve_end_date("")
-            fetch_all_pitchers_list_materialized(sl_start, totals_end)
+            if fetch_all_pitchers_list_materialized(sl_start, totals_end) is None:
+                # Strict build needs the WHOLE season baked, and the job that
+                # queues that (warmup-daily-2) runs 20 minutes after this one.
+                # So on any morning materialization is behind, this would leave
+                # no directory at all and every cold instance would refold the
+                # season for the rest of the day. Persist the partial instead.
+                rows = warm_partial_pitcher_directory(sl_start, totals_end)
+                print(f"[WarmupDaily] Range incomplete; cached partial directory ({len(rows)} pitchers)")
         except Exception as e:
             print(f"[WarmupDaily] Pitcher list warm error: {e}")
         now = _now_et().isoformat()

@@ -2700,10 +2700,54 @@ def fetch_pitchers_directory(start_date, end_date):
         # Refresh the canonical copy in the background if it has expired.
         _background_build_pitcher_directory(start_date, end_date)
         return dir_val
-    # Cold miss: serve whatever per-day snapshots we have right now and warm
-    # the full list in the background for the next request.
+    # Cold miss: serve whatever per-day snapshots we have right now. On
+    # serverless the background build is a no-op (see there), so without the
+    # short-TTL write below EVERY cold instance would repeat the same ~140-day
+    # fold and none of them would leave anything behind for the next one.
     _background_build_pitcher_directory(start_date, end_date)
-    return fetch_pitchers_list_partial(start_date, end_date) or []
+    partial = fetch_pitchers_list_partial(start_date, end_date) or []
+    if partial:
+        _persist_partial_pitcher_directory(start_date, end_date, partial)
+    return partial
+
+
+# How long a PARTIAL directory may be served from Redis. Short on purpose: it
+# is assembled from whatever days happen to be baked, so it must give way to
+# the real list as soon as the range finishes materializing. Long enough that
+# cold instances stop repeating an identical ~140-day fold.
+PARTIAL_DIR_TTL = 60 * 60
+
+
+def _persist_partial_pitcher_directory(start_date, end_date, result):
+    """Cache an INCOMPLETE directory briefly, under the ordinary key only.
+
+    Deliberately NOT the never-expiring pitcher_dir: key — that one is the
+    canonical snapshot and must only ever hold a complete list. Writing the
+    short-TTL key costs nothing in correctness: the value is exactly what the
+    request already returns, so the only thing that changes is that the next
+    cold instance reads it instead of recomputing it.
+    """
+    try:
+        key = _pitchers_list_key(start_date, end_date)
+        redis_set(key, result, ttl=PARTIAL_DIR_TTL)
+        _index_cache_key(key, key)
+    except Exception:
+        pass
+
+
+def warm_partial_pitcher_directory(start_date, end_date):
+    """Build and cache the best-effort directory.
+
+    For the daily cron to fall back on: warmup-daily's strict build returns
+    None until the whole season is baked, and warmup-daily-2 (which queues the
+    materialization) runs 20 minutes AFTER it. On any morning where the range
+    is behind, that ordering leaves no directory at all for the rest of the
+    day. This guarantees search has something fast to read either way.
+    """
+    result = fetch_pitchers_list_partial(start_date, end_date) or []
+    if result:
+        _persist_partial_pitcher_directory(start_date, end_date, result)
+    return result
 
 
 def fetch_pitchers_list_partial(start_date, end_date):

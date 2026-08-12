@@ -636,11 +636,17 @@ export default function App() {
     };
   }, [cardData, date, linescoreData]);
 
-  const isStatcastLevel = useMemo(() => {
-    if (!levelMeta) return level === "AAA" || level === "AFL";
-    const entry = levelMeta.levels.find(l => l.code === level);
-    return entry ? entry.statcast : false;
-  }, [levelMeta, level]);
+  // Does a given LEVEL CODE have game cards? Distinct from isStatcastLevel
+  // below, which answers it for the page's currently selected level. The Rehab
+  // view ignores the level filter by design, so its rows span every level and
+  // each one has to be asked separately.
+  const isCardLevel = useCallback((code) => {
+    if (!levelMeta) return code === "AAA" || code === "AFL";
+    const entry = levelMeta.levels.find(l => l.code === code);
+    return entry ? !!entry.statcast : false;
+  }, [levelMeta]);
+
+  const isStatcastLevel = useMemo(() => isCardLevel(level), [isCardLevel, level]);
 
   const filteredPitchData = useMemo(() => {
     let rows = pitchData;
@@ -970,6 +976,8 @@ export default function App() {
                 : <RehabStartsTable
                     data={rehabData}
                     onPitcherClick={(id, e) => navigateToPlayer(id, null, e)}
+                    onGameClick={navigateToGameCard}
+                    isCardLevel={isCardLevel}
                     hiddenCols={rehabHiddenCols}
                     sortKey={rehabSortKey}
                     onSortKeyChange={setRehabSortKey}

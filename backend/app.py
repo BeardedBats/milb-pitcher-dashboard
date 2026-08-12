@@ -53,6 +53,7 @@ from levels import (
     is_statcast_level, all_orgs, affiliates_for_org, team_display_name,
     level_sort_key as _level_sort_key,
 )
+import ledger
 from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers, cached_milb_pitchers,
@@ -109,13 +110,17 @@ def _resolve_end_date(end_date: str) -> str:
     return _now_et().strftime("%Y-%m-%d")
 
 
+def _is_today_str(date_str: str) -> bool:
+    return bool(date_str) and date_str == _resolve_end_date("")
+
+
 def _cache_scope_for_date(date_str: str) -> str:
     return "past" if date_str and date_str < get_baseball_date() else "live"
 
 
 def _set_response_cache(response: Response, scope: str):
     if scope == "past":
-        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=2592000"
     elif scope == "mutation":
         response.headers["Cache-Control"] = "no-store"
     else:
@@ -125,7 +130,7 @@ def _set_response_cache(response: Response, scope: str):
 def _json_response(payload, status_code=200, scope="live"):
     resp = JSONResponse(payload, status_code=status_code)
     if scope == "past":
-        resp.headers["Cache-Control"] = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+        resp.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=2592000"
     elif scope == "mutation":
         resp.headers["Cache-Control"] = "no-store"
     else:
@@ -1472,6 +1477,22 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
     cached = get_agg_cache(agg_key)
     if cached is not None:
         return cached
+    # Ledger fast path: season-through-yesterday is precomputed as running
+    # accumulators, so this is one Redis read + a finalize, with today's cached
+    # day frame layered on top. Only for the canonical season window — the
+    # ledger has exactly one high-water mark, so any other window folds below.
+    if start_date == SEASON_START and _is_today_str(end_date):
+        try:
+            rows = ledger.team_season_rows(team, view, today_df=fetch_date(end_date))
+        except Exception as e:
+            print(f"[TeamPitchers] ledger path failed: {e}")
+            rows = None
+        if rows is not None:
+            result = tag_mlb_experience(rows)
+            if result:
+                set_agg_cache(agg_key, result)
+            return result
+
     # Streamed a day at a time rather than materializing the whole season into
     # one frame first — see fold_range_materialized. Only this team's rows are
     # ever accumulated, so peak memory is one day, not ~612k pitch rows.
@@ -1697,6 +1718,16 @@ def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
     # repairs itself in a couple of minutes. Same rule /api/pitcher-card uses
     # for degraded payloads.
     statcast_pending = False
+    if aaa_blocks and aaa_rows_by_team is None and _is_today_str(end_date) \
+            and start_date == SEASON_START:
+        # Ledger fast path — same one-read shape as team pages. None when the
+        # ledger is behind, in which case the fold below decides as before.
+        try:
+            aaa_rows_by_team = ledger.aaa_rows_for_teams(
+                [b["team"] for b in aaa_blocks], today_df=fetch_date(end_date))
+        except Exception as e:
+            print(f"[OrgPage] ledger path failed: {e}")
+            aaa_rows_by_team = None
     if aaa_blocks and aaa_rows_by_team is not None:
         # Rows already folded by the caller — no range pass at all.
         for block in aaa_blocks:
@@ -1940,8 +1971,18 @@ def cron_materialize_ranges(request: Request, response: Response, max_jobs: int 
     try:
         # Leave headroom inside the 300s limit so the job can write its
         # heartbeat and, if it finished, its ready state before being killed.
-        drained = drain_pending_materializations(max_jobs=max_jobs, deadline=time.time() + 240)
-        return {"status": "ok", "count": len(drained), "drained": drained}
+        deadline = time.time() + 240
+        drained = drain_pending_materializations(max_jobs=max_jobs, deadline=deadline)
+        # Advance the season ledger with whatever budget remains. Steady state
+        # is one folded day per morning; an initial or post-override rebuild
+        # spreads across a few ticks via the checkpointed high-water mark.
+        try:
+            ledger_status = ledger.advance_ledger(deadline=deadline)
+        except Exception as e:
+            print(f"[Ledger] advance failed: {e}")
+            ledger_status = {"error": str(e)}
+        return {"status": "ok", "count": len(drained), "drained": drained,
+                "ledger": ledger_status}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 

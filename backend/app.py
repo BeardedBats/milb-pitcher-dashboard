@@ -53,6 +53,7 @@ from levels import (
     is_statcast_level, all_orgs, affiliates_for_org, team_display_name,
     level_sort_key as _level_sort_key,
 )
+import ledger
 from boxscore_levels import (
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers, cached_milb_pitchers,
@@ -109,13 +110,17 @@ def _resolve_end_date(end_date: str) -> str:
     return _now_et().strftime("%Y-%m-%d")
 
 
+def _is_today_str(date_str: str) -> bool:
+    return bool(date_str) and date_str == _resolve_end_date("")
+
+
 def _cache_scope_for_date(date_str: str) -> str:
     return "past" if date_str and date_str < get_baseball_date() else "live"
 
 
 def _set_response_cache(response: Response, scope: str):
     if scope == "past":
-        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+        response.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=2592000"
     elif scope == "mutation":
         response.headers["Cache-Control"] = "no-store"
     else:
@@ -125,7 +130,7 @@ def _set_response_cache(response: Response, scope: str):
 def _json_response(payload, status_code=200, scope="live"):
     resp = JSONResponse(payload, status_code=status_code)
     if scope == "past":
-        resp.headers["Cache-Control"] = "public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800"
+        resp.headers["Cache-Control"] = "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=2592000"
     elif scope == "mutation":
         resp.headers["Cache-Control"] = "no-store"
     else:
@@ -1066,12 +1071,36 @@ def _warm_player_page_cache_for_pitchers(
     start_date,
     end_date,
     preloaded_df=None,
+    deadline=None,
 ):
-    """Overwrite stable player-page cache entries for a small pitcher set."""
+    """Overwrite stable player-page cache entries for a small pitcher set.
+
+    `pitcher_ids` is consumed IN THE ORDER GIVEN (deduped, first occurrence
+    wins), so a caller can put the pitchers it cares about most at the front
+    and have them survive a budget cut. It used to sort by pitcher id, which
+    is effectively random with respect to level and role — under a deadline
+    that spent the budget on whoever happened to have a low id.
+
+    Returns a dict so the caller can splat it into a response body.
+    """
     suffix = _season_cache_suffix(start_date, end_date)
     warmed = 0
     skipped = 0
-    for pid in sorted({int(p) for p in (pitcher_ids or []) if p is not None}):
+    budget_hit = False
+
+    ordered, seen = [], set()
+    for p in (pitcher_ids or []):
+        if p is None:
+            continue
+        pid = int(p)
+        if pid not in seen:
+            seen.add(pid)
+            ordered.append(pid)
+
+    for pid in ordered:
+        if deadline is not None and time.time() >= deadline:
+            budget_hit = True
+            break
         agg_key = f"player_v2_{pid}_s{CARD_SCHEMA_VERSION}{suffix}"
         try:
             result = _build_player_page_payload(
@@ -1088,7 +1117,8 @@ def _warm_player_page_cache_for_pitchers(
         except Exception as e:
             print(f"[PlayerPageWarm] Error computing player {pid}: {e}")
             skipped += 1
-    return warmed, skipped
+    return {"warmed": warmed, "skipped": skipped, "budget_hit": budget_hit,
+            "requested": len(ordered)}
 
 
 def _pitcher_half_inning_settled(game_pk, pitcher_id):
@@ -1447,6 +1477,22 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
     cached = get_agg_cache(agg_key)
     if cached is not None:
         return cached
+    # Ledger fast path: season-through-yesterday is precomputed as running
+    # accumulators, so this is one Redis read + a finalize, with today's cached
+    # day frame layered on top. Only for the canonical season window — the
+    # ledger has exactly one high-water mark, so any other window folds below.
+    if start_date == SEASON_START and _is_today_str(end_date):
+        try:
+            rows = ledger.team_season_rows(team, view, today_df=fetch_date(end_date))
+        except Exception as e:
+            print(f"[TeamPitchers] ledger path failed: {e}")
+            rows = None
+        if rows is not None:
+            result = tag_mlb_experience(rows)
+            if result:
+                set_agg_cache(agg_key, result)
+            return result
+
     # Streamed a day at a time rather than materializing the whole season into
     # one frame first — see fold_range_materialized. Only this team's rows are
     # ever accumulated, so peak memory is one day, not ~612k pitch rows.
@@ -1562,6 +1608,12 @@ def rehab_starts(response: Response, days: int = Query(14)):
         # in a Rookie-ball feed would otherwise print as a real average.
         if row.get("level") in STATCAST_LEVELS:
             row["avg_velo"] = metrics.get("avg_velo")
+            # The Velo column reads the primary fastball, not the all-pitch
+            # mean: "is his fastball back" is the question this view exists to
+            # answer, and an all-pitch mean moves with pitch mix instead.
+            row["fb_velo"] = metrics.get("fb_velo")
+            row["fb_pitch"] = metrics.get("fb_pitch")
+            row["fb_count"] = metrics.get("fb_count")
 
     def _starts_for(pid, levels):
         found = []
@@ -1607,32 +1659,23 @@ def rehab_starts(response: Response, days: int = Query(14)):
     return payload
 
 
-@app.get("/api/org-page")
-def org_page(
-    response: Response,
-    org: str = Query(...),
-    start_date: str = Query(SEASON_START),
-    end_date: str = Query(""),
-):
-    """One MLB org's whole system, one table per affiliate, highest level first.
+def _org_agg_key(org, start_date, end_date):
+    return f"org_{org}_s{CARD_SCHEMA_VERSION}_{start_date}_{end_date}"
 
-    Team pages route per MLB ORG (LAD, not "Oklahoma City"), so this returns an
-    ordered list of affiliate blocks — AAA, AA, A+, A, R. The AAA block carries
-    full Statcast result rows; the rest carry adapted box-score rows aggregated
-    over the date range from each pitcher's gameLog. AFL has no parent org, so
-    it never appears here.
+
+def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
+    """Build one org's affiliate blocks. Returns (payload, statcast_pending).
+
+    `aaa_rows_by_team` lets a caller that has ALREADY folded the season supply
+    the AAA rows instead of making this function fold again. That is not a
+    micro-optimisation: the fold walks every day in the range, so warming all
+    30 orgs without it would mean 30 separate full-season passes.
+    warmup-daily-2 runs exactly one pass for its per-team aggregates and hands
+    the result here.
     """
-    end_date = _resolve_end_date(end_date)
-    _set_response_cache(response, _cache_scope_for_date(end_date))
-    org = (org or "").strip().upper()
     affiliates = affiliates_for_org(org)
     if not affiliates:
-        return {"org": org, "affiliates": []}
-
-    agg_key = f"org_{org}_s{CARD_SCHEMA_VERSION}_{start_date}_{end_date}"
-    cached = get_agg_cache(agg_key)
-    if cached is not None:
-        return cached
+        return {"org": org, "affiliates": []}, False
 
     # Every affiliate — INCLUDING AAA — is built from the per-team season
     # endpoint, one request each. That is the whole page's data.
@@ -1675,7 +1718,24 @@ def org_page(
     # repairs itself in a couple of minutes. Same rule /api/pitcher-card uses
     # for degraded payloads.
     statcast_pending = False
-    if aaa_blocks:
+    if aaa_blocks and aaa_rows_by_team is None and _is_today_str(end_date) \
+            and start_date == SEASON_START:
+        # Ledger fast path — same one-read shape as team pages. None when the
+        # ledger is behind, in which case the fold below decides as before.
+        try:
+            aaa_rows_by_team = ledger.aaa_rows_for_teams(
+                [b["team"] for b in aaa_blocks], today_df=fetch_date(end_date))
+        except Exception as e:
+            print(f"[OrgPage] ledger path failed: {e}")
+            aaa_rows_by_team = None
+    if aaa_blocks and aaa_rows_by_team is not None:
+        # Rows already folded by the caller — no range pass at all.
+        for block in aaa_blocks:
+            rows = aaa_rows_by_team.get(block["team"])
+            if rows:
+                block["rows"] = tag_mlb_experience(rows)
+                block["statcast"] = True
+    elif aaa_blocks:
         accs = {b["team"]: new_results_accumulator() for b in aaa_blocks}
 
         def fold(day_df):
@@ -1711,10 +1771,42 @@ def org_page(
             except Exception as e:
                 print(f"[OrgPage] could not queue materialization: {e}")
 
-    payload = {"org": org, "affiliates": blocks}
-    if any(b["rows"] for b in blocks) and not statcast_pending:
+    return {"org": org, "affiliates": blocks}, statcast_pending
+
+
+def _org_page_cached(org, start_date, end_date, aaa_rows_by_team=None):
+    """Get-or-build one org payload, applying the don't-cache-degraded rule."""
+    agg_key = _org_agg_key(org, start_date, end_date)
+    cached = get_agg_cache(agg_key)
+    if cached is not None:
+        return cached
+    payload, statcast_pending = _build_org_page_payload(
+        org, start_date, end_date, aaa_rows_by_team=aaa_rows_by_team,
+    )
+    if any(b["rows"] for b in payload["affiliates"]) and not statcast_pending:
         set_agg_cache(agg_key, payload)
     return payload
+
+
+@app.get("/api/org-page")
+def org_page(
+    response: Response,
+    org: str = Query(...),
+    start_date: str = Query(SEASON_START),
+    end_date: str = Query(""),
+):
+    """One MLB org's whole system, one table per affiliate, highest level first.
+
+    Team pages route per MLB ORG (LAD, not "Oklahoma City"), so this returns an
+    ordered list of affiliate blocks — AAA, AA, A+, A, R. The AAA block carries
+    full Statcast result rows; the rest carry adapted box-score rows aggregated
+    over the date range from each pitcher's gameLog. AFL has no parent org, so
+    it never appears here.
+    """
+    end_date = _resolve_end_date(end_date)
+    _set_response_cache(response, _cache_scope_for_date(end_date))
+    org = (org or "").strip().upper()
+    return _org_page_cached(org, start_date, end_date)
 
 
 @app.get("/api/player-page")
@@ -1879,8 +1971,18 @@ def cron_materialize_ranges(request: Request, response: Response, max_jobs: int 
     try:
         # Leave headroom inside the 300s limit so the job can write its
         # heartbeat and, if it finished, its ready state before being killed.
-        drained = drain_pending_materializations(max_jobs=max_jobs, deadline=time.time() + 240)
-        return {"status": "ok", "count": len(drained), "drained": drained}
+        deadline = time.time() + 240
+        drained = drain_pending_materializations(max_jobs=max_jobs, deadline=deadline)
+        # Advance the season ledger with whatever budget remains. Steady state
+        # is one folded day per morning; an initial or post-override rebuild
+        # spreads across a few ticks via the checkpointed high-water mark.
+        try:
+            ledger_status = ledger.advance_ledger(deadline=deadline)
+        except Exception as e:
+            print(f"[Ledger] advance failed: {e}")
+            ledger_status = {"error": str(e)}
+        return {"status": "ok", "count": len(drained), "drained": drained,
+                "ledger": ledger_status}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 
@@ -2059,10 +2161,60 @@ def cron_warmup_daily(request: Request, response: Response):
                 print(f"[WarmupDaily] Range incomplete; cached partial directory ({len(rows)} pitchers)")
         except Exception as e:
             print(f"[WarmupDaily] Pitcher list warm error: {e}")
+
+        # Last week's slates, so paging back a day on the homepage is instant.
+        #
+        # This is cheap in the steady state and that is the whole point: a
+        # PAST-date agg key never expires (see _agg_key_ttl), so a given date
+        # costs this once and is then permanent. After the first run the loop
+        # is a handful of cache hits, and only the newly-rolled-off day does
+        # real work. Nothing warmed these before — the first person to page
+        # back paid the full aggregation for that date.
+        #
+        # Runs LAST on purpose. It shares the deadline with the directory warm
+        # above, which serves search, and search is the higher priority; a slow
+        # morning should cut this tail rather than that.
+        # AAA leads because it is the homepage default.
+        recent_levels = ["AAA"] + [c for c in LEVEL_ORDER if c != "AAA"]
+        recent_warmed, recent_skipped = 0, 0
+        base_day = datetime.strptime(default_date, "%Y-%m-%d")
+        for back in range(1, 8):
+            day = (base_day - timedelta(days=back)).strftime("%Y-%m-%d")
+            for code in recent_levels:
+                if time.time() >= deadline:
+                    recent_skipped += 1
+                    continue
+                try:
+                    if is_statcast_level(code):
+                        pitch_key = f"daily_pitch_{code}_{day}"
+                        results_key = f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{day}"
+                        if (get_agg_cache(pitch_key) is not None
+                                and get_agg_cache(results_key) is not None):
+                            continue
+                        get_games(day, code)
+                        set_agg_cache(pitch_key, aggregate_pitch_data(day, None, level=code))
+                        set_agg_cache(results_key,
+                                      aggregate_pitcher_results(day, None, level=code))
+                    else:
+                        box_key = (f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}"
+                                   f"m{_METRICS_VERSION}_{day}")
+                        if get_agg_cache(box_key) is not None:
+                            continue
+                        get_games(day, code)
+                        rows = get_level_results(day, code)
+                        if rows:
+                            set_agg_cache(box_key, rows)
+                    recent_warmed += 1
+                except Exception as e:
+                    print(f"[WarmupDaily] recent slate {day}/{code} failed: {e}")
+                    recent_skipped += 1
+
         now = _now_et().isoformat()
         redis_set("last_refresh", now)
         return {"status": "ok", "timestamp": now, "date": default_date,
-                "levels_warmed": warmed, "levels_skipped": skipped}
+                "levels_warmed": warmed, "levels_skipped": skipped,
+                "recent_slates_warmed": recent_warmed,
+                "recent_slates_skipped": recent_skipped}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 
@@ -2114,11 +2266,17 @@ def cron_warmup_daily_season(request: Request, response: Response):
             return {"status": "deferred", "reason": "range not materialized",
                     "start_date": start_date, "end_date": end_date}
 
+        # Finalized once, used twice: for the team_ keys below and for every
+        # org payload further down. Building the org pages from these rows is
+        # what makes warming all 30 affordable — each would otherwise run its
+        # own full-season fold.
+        aaa_rows_by_team = {}
         for team in list(results_acc):
             if time.time() >= deadline:
                 break
-            set_agg_cache(f"team_{team}_results_{start_date}_{end_date}",
-                          finalize_pitcher_results(results_acc[team]))
+            rows = finalize_pitcher_results(results_acc[team])
+            aaa_rows_by_team[team] = rows
+            set_agg_cache(f"team_{team}_results_{start_date}_{end_date}", rows)
             set_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}",
                           finalize_pitch_data(pitch_acc[team]))
 
@@ -2138,6 +2296,22 @@ def cron_warmup_daily_season(request: Request, response: Response):
                 print(f"[WarmupDaily2] org {org} failed: {e}")
                 skipped_orgs.append(org)
 
+        # The org payloads THEMSELVES, not just their inputs. Nothing warmed
+        # these before, so every org page view rebuilt ~7 affiliate blocks plus
+        # a full-season fold for the AAA upgrade. Here the fold has already
+        # happened once above, so each org costs only its non-AAA affiliate
+        # lookups — which the loop above just warmed.
+        orgs_cached = 0
+        for org in warmed_orgs:
+            if time.time() >= deadline:
+                break
+            try:
+                _org_page_cached(org, start_date, end_date,
+                                 aaa_rows_by_team=aaa_rows_by_team)
+                orgs_cached += 1
+            except Exception as e:
+                print(f"[WarmupDaily2] org payload {org} failed: {e}")
+
         # All-levels search directory. Every affiliate call it needs is warm
         # from the loop above, so this is nearly free here and saves the first
         # searcher of the day a ~200-request cold sweep.
@@ -2148,9 +2322,10 @@ def cron_warmup_daily_season(request: Request, response: Response):
             print(f"[WarmupDaily2] directory build failed: {e}")
 
         return {"status": "ok", "orgs_warmed": len(warmed_orgs),
+                "org_pages_cached": orgs_cached,
                 "orgs_skipped": skipped_orgs,
                 "directory_pitchers": directory_size,
-                "budget_hit": bool(skipped_orgs)}
+                "budget_hit": bool(skipped_orgs) or orgs_cached < len(warmed_orgs)}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 
@@ -2227,7 +2402,10 @@ def cron_warmup_daily_players(request: Request, response: Response):
         season_start_str = _season_start(_now_et().year)
         end_date = _resolve_end_date("")
 
-        pitcher_ids = set()
+        # Warm order matters: this job is budget-bounded, so whatever is at the
+        # front is what actually gets warmed on a slow morning. Priority is
+        # AAA starters, then the rest of AAA, then every other level.
+        aaa_starters, aaa_rest, other_levels = [], [], []
         for code in LEVEL_ORDER:
             if time.time() >= deadline:
                 break
@@ -2238,23 +2416,36 @@ def cron_warmup_daily_players(request: Request, response: Response):
                 else:
                     rows = get_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{default_date}") \
                         or get_level_results(default_date, code)
-                pitcher_ids.update(int(r["pitcher_id"]) for r in (rows or []) if r.get("pitcher_id"))
+                for r in (rows or []):
+                    pid = r.get("pitcher_id")
+                    if pid is None:
+                        continue
+                    if code != "AAA":
+                        other_levels.append(int(pid))
+                    elif r.get("role") == "SP":
+                        aaa_starters.append(int(pid))
+                    else:
+                        aaa_rest.append(int(pid))
             except Exception as e:
                 print(f"[WarmupDailyPlayers] {code} results failed: {e}")
 
         # Today's probable starters too, so the first card view of a pitcher who
-        # didn't appear yesterday still hits a warm cache.
+        # didn't appear yesterday still hits a warm cache. AAA's go to the very
+        # front — a probable starter is the most likely player page to be opened
+        # today, and he has no row in yesterday's results to be found under.
+        probable_aaa, probable_other = [], []
         for code in STATCAST_LEVELS:
             try:
-                pitcher_ids.update(get_probable_starter_ids(default_date, level=code))
+                ids = [int(p) for p in get_probable_starter_ids(default_date, level=code)]
             except Exception:
-                pass
+                continue
+            (probable_aaa if code == "AAA" else probable_other).extend(ids)
 
+        ordered_ids = probable_aaa + aaa_starters + aaa_rest + probable_other + other_levels
         stats = _warm_player_page_cache_for_pitchers(
-            pitcher_ids, season_start_str, end_date, deadline=deadline,
+            ordered_ids, season_start_str, end_date, deadline=deadline,
         )
-        return {"status": "ok", "date": default_date,
-                "pitchers": len(pitcher_ids), **(stats or {})}
+        return {"status": "ok", "date": default_date, **stats}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 
@@ -2277,7 +2468,11 @@ def cron_warmup_daily_cards(request: Request, response: Response):
         for code in STATCAST_LEVELS:
             rows = get_agg_cache(f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{default_date}") \
                 or aggregate_pitcher_results(default_date, None, level=code)
-            for r in (rows or []):
+            # Starters first within each level. This loop is budget-bounded, so
+            # on a slow morning the tail is dropped — and a starter's card is
+            # both the likelier click and the more expensive one to build cold.
+            rows = sorted((rows or []), key=lambda r: r.get("role") != "SP")
+            for r in rows:
                 if time.time() >= deadline:
                     print(f"[WarmupDailyCards] Deadline hit after {warmed} cards")
                     return {"status": "ok", "date": default_date, "cards_warmed": warmed,

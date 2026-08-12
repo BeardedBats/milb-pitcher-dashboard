@@ -2604,15 +2604,19 @@ def fetch_all_pitchers_list_materialized(start_date, end_date):
     if redis_val is not None:
         _pitchers_list_cache[cache_key] = (time.time(), redis_val)
         return redis_val
-    # Streamed a day at a time — see the accumulator above. This used to call
-    # fetch_date_range_materialized and hand a whole-season frame to
-    # build_pitchers_list_from_df, which is the allocation that OOM-killed the
-    # directory endpoints.
-    acc = new_pitchers_list_accumulator()
-    if not fold_range_materialized(start_date, end_date,
-                                   lambda day_df: accumulate_pitchers_list(acc, day_df)):
-        return None
-    result = finalize_pitchers_list(acc)
+    # Ledger first: the season directory through yesterday is a running
+    # accumulator, so this is one read + finalize with today layered on top.
+    result = _directory_from_ledger(start_date, end_date)
+    if result is None:
+        # Streamed a day at a time — see the accumulator above. This used to
+        # call fetch_date_range_materialized and hand a whole-season frame to
+        # build_pitchers_list_from_df, the allocation that OOM-killed the
+        # directory endpoints.
+        acc = new_pitchers_list_accumulator()
+        if not fold_range_materialized(start_date, end_date,
+                                       lambda day_df: accumulate_pitchers_list(acc, day_df)):
+            return None
+        result = finalize_pitchers_list(acc)
     _pitchers_list_cache[cache_key] = (time.time(), result)
     # Long TTL — a pitcher roster is mostly stable across the season. The
     # daily/live warmup crons explicitly refresh this so debut pitchers
@@ -2705,6 +2709,13 @@ def fetch_pitchers_directory(start_date, end_date):
     # short-TTL write below EVERY cold instance would repeat the same ~140-day
     # fold and none of them would leave anything behind for the next one.
     _background_build_pitcher_directory(start_date, end_date)
+    # Ledger first — a COMPLETE directory in one read. Only when the ledger is
+    # behind does the best-effort partial fold below run at all.
+    full = _directory_from_ledger(start_date, end_date)
+    if full:
+        _pitchers_list_cache[cache_key] = (time.time(), full)
+        _persist_pitcher_directory(start_date, end_date, full)
+        return full
     partial = fetch_pitchers_list_partial(start_date, end_date) or []
     if partial:
         _persist_partial_pitcher_directory(start_date, end_date, partial)
@@ -2748,6 +2759,23 @@ def warm_partial_pitcher_directory(start_date, end_date):
     if result:
         _persist_partial_pitcher_directory(start_date, end_date, result)
     return result
+
+
+def _directory_from_ledger(start_date, end_date):
+    """Full directory from the season ledger, or None.
+
+    Only for the canonical window (season start through today) — the ledger
+    has one high-water mark and cannot answer arbitrary ranges. Function-level
+    import because ledger imports this module.
+    """
+    if start_date != SEASON_START or not _is_today(end_date):
+        return None
+    try:
+        import ledger
+        return ledger.directory_rows(today_df=fetch_date(end_date))
+    except Exception as e:
+        print(f"[Directory] ledger path failed: {e}")
+        return None
 
 
 def fetch_pitchers_list_partial(start_date, end_date):

@@ -23,7 +23,11 @@ export const REHAB_COLUMNS = [
   { key: "swstr_pct", label: "SwStr%" },
   { key: "csw_pct", label: "CSW%" },
   { key: "strike_pct", label: "Str%" },
-  { key: "avg_velo", label: "Velo", title: "Average velocity — pitch-tracked levels only" },
+  {
+    key: "fb_velo",
+    label: "Velo",
+    title: "Primary fastball velocity — four-seamer or sinker, whichever he threw more of. Pitch-tracked levels only",
+  },
   { key: "rehab_starts", label: "Rehab GS", title: "Starts made in this window" },
   { key: "il_status", label: "IL Status" },
 ];
@@ -34,7 +38,7 @@ export const REHAB_DEFAULT_HIDDEN = ["team", "opponent"];
 
 const PCT_KEYS = new Set(["strike_pct", "csw_pct", "swstr_pct"]);
 const NUMERIC_KEYS = new Set([
-  "hits", "runs", "er", "bbs", "ks", "hrs", "pitches", "rehab_starts", "avg_velo",
+  "hits", "runs", "er", "bbs", "ks", "hrs", "pitches", "rehab_starts", "fb_velo",
   ...PCT_KEYS,
 ]);
 
@@ -106,7 +110,7 @@ export default function RehabStartsTable({
     // Rates read as whole numbers here — a tenth of a percent on 80 pitches is
     // noise, and the extra digit only makes the row harder to scan.
     if (PCT_KEYS.has(key)) return `${Math.round(v)}%`;
-    if (key === "avg_velo") return Number(v).toFixed(1);
+    if (key === "fb_velo") return Number(v).toFixed(1);
     return v;
   };
 
@@ -202,6 +206,18 @@ export default function RehabStartsTable({
                 return (
                   <td key={c.key}>
                     <span className="rehab-il-tag">{row.il_status || row.il_status_code || "IL"}</span>
+                  </td>
+                );
+              }
+              if (c.key === "fb_velo") {
+                // Which fastball the number is, on the cell itself — the
+                // header can't say it, because it differs per row.
+                const which = row.fb_pitch
+                  ? `${row.fb_pitch}${row.fb_count ? ` — ${row.fb_count} thrown` : ""}`
+                  : undefined;
+                return (
+                  <td key={c.key} className={isZero(row, c.key) ? "zero-cell" : undefined} title={which}>
+                    {fmt(row, c.key)}
                   </td>
                 );
               }

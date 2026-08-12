@@ -1562,6 +1562,12 @@ def rehab_starts(response: Response, days: int = Query(14)):
         # in a Rookie-ball feed would otherwise print as a real average.
         if row.get("level") in STATCAST_LEVELS:
             row["avg_velo"] = metrics.get("avg_velo")
+            # The Velo column reads the primary fastball, not the all-pitch
+            # mean: "is his fastball back" is the question this view exists to
+            # answer, and an all-pitch mean moves with pitch mix instead.
+            row["fb_velo"] = metrics.get("fb_velo")
+            row["fb_pitch"] = metrics.get("fb_pitch")
+            row["fb_count"] = metrics.get("fb_count")
 
     def _starts_for(pid, levels):
         found = []

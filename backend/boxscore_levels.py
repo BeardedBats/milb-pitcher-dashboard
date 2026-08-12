@@ -114,11 +114,23 @@ _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 #      as a hand-written literal "rows:v2", which is why numbering starts here
 #   3: five metric families + per-hand splits
 #   4: avg_velo (feed startSpeed; None wherever the level isn't pitch-tracked)
+#   5: fb_velo / fb_pitch / fb_count — primary-fastball velocity
 #
 # Note the near-miss: replacing the literal with a constant set to 2 produced a
 # byte-identical key and kept serving the very rows the bump was meant to
 # retire. A version bump is only real if the resulting key string changes.
-_METRICS_VERSION = 4
+_METRICS_VERSION = 5
+
+
+# Pitches that count toward the "primary fastball". Two families only —
+# four-seam and sinker — because that is the comparison a rehab reader is
+# making: is his fastball back? Cutters and splitters are fastball-adjacent but
+# sit several ticks apart and would muddy it.
+#   FA is the feed's unspecified "Fastball"; it behaves as a four-seamer.
+#   FT is the retired two-seam code, still present on older games; same pitch
+#   as SI, so it folds in rather than splitting the sinker's sample in two.
+_FASTBALL_CODES = {"FF": "FF", "FA": "FF", "SI": "SI", "FT": "SI"}
+_FASTBALL_NAMES = {"FF": "Four-Seamer", "SI": "Sinker"}
 
 
 def _l2_get(key):
@@ -260,6 +272,11 @@ def _new_bucket():
         # buckets stay mergeable and pitches without a reading don't drag the
         # average toward zero.
         "velo_sum": 0.0, "velo_count": 0,
+        # {"FF": [sum, count], "SI": [...]} — same (sum, count) reasoning as
+        # above, kept per family so the primary fastball can be picked at
+        # finalize time rather than guessed up front. NOT "fb": that key is
+        # already the FLY BALL counter a few lines up.
+        "fastballs": {},
     }
 
 
@@ -286,9 +303,28 @@ def _spray_bucket(location, bat_side):
     return None
 
 
+def _primary_fastball(m):
+    """(family, mean velo, pitches) for whichever fastball he threw MORE of.
+
+    A rehab reader wants "is his fastball back?", and a mean over every pitch
+    answers a different question — it moves with pitch mix, so a start with
+    more breaking balls reads as lost velocity. Ties break to the four-seamer,
+    which is the one a reader assumes when a pitcher throws both evenly.
+    """
+    fastballs = m.get("fastballs") or {}
+    if not fastballs:
+        return None, None, 0
+    family = max(fastballs, key=lambda k: (fastballs[k][1], k == "FF"))
+    total, count = fastballs[family]
+    if not count:
+        return None, None, 0
+    return family, round(total / count, 1), count
+
+
 def _finalize(m):
     """Turn raw counters into the published metric dict."""
     p = m["tracked_pitches"]
+    fb_family, fb_velo, fb_count = _primary_fastball(m)
     bip = m["bip"]
     zk = m["zone_known"]
     hk = m["hardness_known"]
@@ -298,6 +334,13 @@ def _finalize(m):
         # None (not 0.0) when nothing was tracked, so the UI shows a hyphen —
         # the normal case below AAA, where the feed carries no startSpeed.
         "avg_velo": round(m["velo_sum"] / m["velo_count"], 1) if m["velo_count"] else None,
+        # Primary fastball. None on the same terms as avg_velo (no readings) and
+        # additionally when he threw no four-seamer or sinker at all — a
+        # knuckleballer or a soft-tosser gets a hyphen rather than a number
+        # borrowed from some other pitch.
+        "fb_velo": fb_velo,
+        "fb_pitch": _FASTBALL_NAMES.get(fb_family),
+        "fb_count": fb_count,
         "whiffs": m["whiffs"],
         "called_strikes": m["called_strikes"],
         "swings": m["swings"],
@@ -441,11 +484,19 @@ def _derive_pitch_metrics(feed):
                 except (TypeError, ValueError):
                     speed = None
 
+                fb_family = _FASTBALL_CODES.get(
+                    ((details.get("type") or {}).get("code") or "").upper()
+                )
+
                 for m in buckets_for(current, bat_side):
                     m["tracked_pitches"] += 1
                     if speed:
                         m["velo_sum"] += speed
                         m["velo_count"] += 1
+                        if fb_family:
+                            entry = m["fastballs"].setdefault(fb_family, [0.0, 0])
+                            entry[0] += speed
+                            entry[1] += 1
                     if code in _WHIFF_CODES:
                         m["whiffs"] += 1
                     elif code in _CALLED_CODES:

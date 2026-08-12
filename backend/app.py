@@ -1668,6 +1668,13 @@ def org_page(
     # built the entire league-wide season frame just to slice a few teams out
     # of it — on a page that treats the result as optional.
     aaa_blocks = [b for b in blocks if b["level"] == "AAA"]
+    # Set when the AAA block SHOULD carry Statcast columns but could not get
+    # them this time. The payload is still correct and still worth returning —
+    # it just must not be CACHED, because the agg TTL would then freeze
+    # box-score columns onto the page for an hour over a gap that typically
+    # repairs itself in a couple of minutes. Same rule /api/pitcher-card uses
+    # for degraded payloads.
+    statcast_pending = False
     if aaa_blocks:
         accs = {b["team"]: new_results_accumulator() for b in aaa_blocks}
 
@@ -1691,9 +1698,21 @@ def org_page(
                 if rows:
                     block["rows"] = tag_mlb_experience(rows)
                     block["statcast"] = True
+        else:
+            statcast_pending = True
+            # Nothing else re-queues a range that lapses mid-day: the 5-minute
+            # cron only drains a queue, and the job that fills it runs once at
+            # 07:40. Without this an org page can sit on box-score columns
+            # until tomorrow. Cheap — queue_range_materialization answers from
+            # the marker set and returns immediately when a job is already
+            # running, so repeat views during a gap do not pile up work.
+            try:
+                queue_range_materialization(start_date, end_date)
+            except Exception as e:
+                print(f"[OrgPage] could not queue materialization: {e}")
 
     payload = {"org": org, "affiliates": blocks}
-    if any(b["rows"] for b in blocks):
+    if any(b["rows"] for b in blocks) and not statcast_pending:
         set_agg_cache(agg_key, payload)
     return payload
 

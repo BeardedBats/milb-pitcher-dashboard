@@ -32,7 +32,7 @@ from data import (
     queue_range_materialization, get_range_materialization_status,
     drain_pending_materializations,
     start_warmup, get_warmup_status, get_agg_cache, set_agg_cache,
-    evict_local_day,
+    evict_local_day, evict_local_boxscores,
     warmup_range_data, fetch_date, fetch_pitcher_season, compute_player_page,
     invalidate_pitcher_related_caches,
     get_override_version, CARD_SCHEMA_VERSION,
@@ -61,6 +61,7 @@ from boxscore_levels import (
     get_team_season_pitchers, get_all_milb_pitchers, cached_milb_pitchers,
     enrich_log_with_pitch_metrics, get_game_pitch_metrics,
     _METRICS_VERSION, _gamelog_for_level,
+    evict_local_transients as _evict_box_transients,
 )
 from mlb_status import (
     get_mlb_experience, tag_mlb_experience, get_il_pitchers, get_starters_in_range,
@@ -2117,7 +2118,15 @@ def _backfill_daily_slates(deadline, max_cold_days=2):
         if did_work:
             cold_days += 1
             warmed_days.append(day)
+            # Evict EVERY per-day/per-game L1 this day populated — the day
+            # frame + agg rows (data), the raw box payloads / derived rows /
+            # pitch metrics (boxscore_levels), and the boxscore stat maps
+            # (data, game_pk-keyed). The first fix evicted only the first
+            # group and the instance still OOM'd, ~75 min instead of ~50:
+            # a slate of RAW box payloads per warmed day was the remainder.
             evict_local_day(day)
+            _evict_box_transients()
+            evict_local_boxscores()
             if time.time() >= deadline:
                 break  # don't advance past a day the deadline cut short
         day_dt -= timedelta(days=1)

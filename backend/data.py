@@ -2333,6 +2333,15 @@ def evict_local_day(date_str):
         _agg_cache.pop(key, None)
 
 
+def evict_local_boxscores():
+    """Clear the per-game boxscore stats L1 dict, keeping nothing — these are
+    derived stat maps refetched cheaply per game. Companion to evict_local_day
+    for the season backfill: keyed by game_pk rather than date, the dict can't
+    be evicted day-scoped, and across a season walk it accumulates a slate of
+    entries per warmed day in the one long-lived cron instance."""
+    _boxscore_cache.clear()
+
+
 def invalidate_pitcher_related_caches(pitcher_ids):
     """Clear stable caches for specific pitchers after data changes."""
     pid_set = {int(pid) for pid in (pitcher_ids or []) if pid is not None}

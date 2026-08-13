@@ -19,6 +19,10 @@ import { downloadCsv } from "../utils/csv";
 export const SEASON_START_DATE = "2026-03-25";
 const CONCURRENCY = 4;
 
+// Statcast rows mark home games via home_team/away_team (the box rows carry a
+// `home` boolean instead) — same test the on-screen table uses.
+const statcastAway = (r) => !(r.home_team && r.team === r.home_team);
+
 // Statcast (AAA/AFL) export columns — the daily performance table's fields,
 // raw. Velo/EXT export the number without the UI's delta annotation.
 const STATCAST_COLUMNS = [
@@ -29,7 +33,7 @@ const STATCAST_COLUMNS = [
   { key: "org", label: "Org" },
   { key: "hand", label: "Hand" },
   { key: "role", label: "Role" },
-  { key: "opponent", label: "Opp", value: r => (r.home ? "" : "@ ") + (r.opponent || "") },
+  { key: "opponent", label: "Opp", value: r => (statcastAway(r) ? "@ " : "") + (r.opponent || "") },
   { key: "decision", label: "Dec" },
   { key: "ip", label: "IP" },
   { key: "runs", label: "R" },
@@ -38,7 +42,8 @@ const STATCAST_COLUMNS = [
   { key: "bbs", label: "BB" },
   { key: "ks", label: "K" },
   { key: "whiffs", label: "Whiffs" },
-  { key: "swstr_pct", label: "SwStr%" },
+  // Daily statcast rows don't carry swstr_pct — derive it from whiffs/pitches.
+  { key: "swstr_pct", label: "SwStr%", value: r => (r.swstr_pct != null ? r.swstr_pct : (r.pitches > 0 && r.whiffs != null ? Math.round((r.whiffs / r.pitches) * 1000) / 10 : "")) },
   { key: "csw_pct", label: "CSW%" },
   { key: "strike_pct", label: "Strike%" },
   { key: "par_pct", label: "PAR%" },
@@ -90,9 +95,11 @@ export default function ExportGameLogsModal({
   const [total, setTotal] = useState(0);
   const [failedDays, setFailedDays] = useState([]);
   const [error, setError] = useState(null);
-  const cancelled = useRef(false);
+  // Per-run cancellation token: each export gets its own object, so starting a
+  // new run can never un-cancel a previous run's still-in-flight workers.
+  const runToken = useRef(null);
 
-  useEffect(() => () => { cancelled.current = true; }, []);
+  useEffect(() => () => { if (runToken.current) runToken.current.cancelled = true; }, []);
 
   const dates = useMemo(() => {
     if (!start || !end || start > end) return [];
@@ -102,7 +109,8 @@ export default function ExportGameLogsModal({
 
   const runExport = async () => {
     if (!dates.length || running) return;
-    cancelled.current = false;
+    const token = { cancelled: false };
+    runToken.current = token;
     setRunning(true);
     setError(null);
     setFailedDays([]);
@@ -115,7 +123,7 @@ export default function ExportGameLogsModal({
     let completed = 0;
 
     const worker = async () => {
-      while (!cancelled.current) {
+      while (!token.cancelled) {
         const i = idx++;
         if (i >= dates.length) return;
         const day = dates[i];
@@ -126,12 +134,14 @@ export default function ExportGameLogsModal({
           failed.push(day);
         }
         completed += 1;
-        setDone(completed);
+        // A cancelled run's in-flight fetches still resolve — don't let them
+        // clobber a newer run's progress counter.
+        if (!token.cancelled) setDone(completed);
       }
     };
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, dates.length) }, worker));
 
-    if (cancelled.current) { setRunning(false); return; }
+    if (token.cancelled) return;
 
     // Flatten in date order, applying the page's filters, and stamp the date
     // on every row (statcast rows don't carry one; box rows do, but the loop's
@@ -166,7 +176,10 @@ export default function ExportGameLogsModal({
     setRunning(false);
   };
 
-  const cancel = () => { cancelled.current = true; setRunning(false); };
+  const cancel = () => {
+    if (runToken.current) runToken.current.cancelled = true;
+    setRunning(false);
+  };
 
   const filterSummary = [
     level,

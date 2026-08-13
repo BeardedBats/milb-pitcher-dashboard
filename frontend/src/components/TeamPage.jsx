@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from "react";
 import { fetchOrgPage, fetchWarmupStatus } from "../utils/api";
 import { buildPlayerHash } from "../utils/navigation";
+import { downloadCsv } from "../utils/csv";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
 import WarmupStalled from "./WarmupStalled";
 import LoadError from "./LoadError";
@@ -54,6 +55,53 @@ function pctOfBF(row, key) {
   const num = key === "bb_pct" ? row.bbs : row.ks;
   if (num == null) return null;
   return (num / bf) * 100;
+}
+
+// All affiliates flattened into one CSV, Level/Team leading, honoring the
+// SP Only / RP Only toggle and the page's default order (last game, newest
+// first, within each affiliate block). Raw values — BB%/K% as numbers, no "%".
+const EXPORT_COLS = [
+  { key: "level", label: "Level" },
+  { key: "team_name", label: "Team" },
+  { key: "pitcher", label: "Pitcher" },
+  { key: "last_game", label: "Last Game" },
+  { key: "ip", label: "IP" },
+  { key: "games", label: "G" },
+  { key: "games_started", label: "GS" },
+  { key: "era", label: "ERA" },
+  { key: "whip", label: "WHIP" },
+  { key: "bb_pct", label: "BB%", value: r => { const v = pctOfBF(r, "bb_pct"); return v == null ? "" : v.toFixed(1); } },
+  { key: "k_pct", label: "K%", value: r => { const v = pctOfBF(r, "k_pct"); return v == null ? "" : v.toFixed(1); } },
+  { key: "hits", label: "H" },
+  { key: "bbs", label: "BB" },
+  { key: "ks", label: "K" },
+  { key: "er", label: "ER" },
+  { key: "hrs", label: "HR" },
+  { key: "go_ao", label: "GO/AO" },
+  { key: "swstr_pct", label: "SwStr%" },
+  { key: "csw_pct", label: "CSW%" },
+  { key: "strike_pct", label: "Strike%" },
+  { key: "velo", label: "Velo" },
+  { key: "ext", label: "EXT" },
+  { key: "ivb", label: "iVB" },
+];
+
+function exportOrgCsv(org, affiliates, spOnly, rpOnly) {
+  const out = [];
+  for (const block of affiliates) {
+    let rows = block.rows || [];
+    if (spOnly) rows = rows.filter(r => r.role === "SP");
+    else if (rpOnly) rows = rows.filter(r => r.role === "RP");
+    rows = [...rows].sort((a, b) => {
+      if (a.last_game == null) return 1;
+      if (b.last_game == null) return -1;
+      return String(b.last_game).localeCompare(String(a.last_game));
+    });
+    for (const r of rows) out.push({ ...r, level: block.level, team_name: block.team_name || block.team });
+  }
+  if (!out.length) return;
+  const roleTag = spOnly ? "_SP" : rpOnly ? "_RP" : "";
+  downloadCsv(`org_${org}${roleTag}.csv`, EXPORT_COLS, out);
 }
 
 function sortValue(row, key) {
@@ -254,15 +302,27 @@ export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
       ) : affiliates.length === 0 ? (
         <div className="no-data">No affiliates found for {org}.</div>
       ) : (
-        affiliates.map(block => (
-          <AffiliateTable
-            key={`${block.level}-${block.team}`}
-            block={block}
-            onPlayerClick={onPlayerClick}
-            spOnly={spOnly}
-            rpOnly={rpOnly}
-          />
-        ))
+        <>
+          {affiliates.map(block => (
+            <AffiliateTable
+              key={`${block.level}-${block.team}`}
+              block={block}
+              onPlayerClick={onPlayerClick}
+              spOnly={spOnly}
+              rpOnly={rpOnly}
+            />
+          ))}
+          <div className="table-actions">
+            <button
+              type="button"
+              className="export-btn"
+              title="Download every affiliate table as one CSV"
+              onClick={() => exportOrgCsv(org, affiliates, spOnly, rpOnly)}
+            >
+              Export Org Tables
+            </button>
+          </div>
+        </>
       )}
     </div>
   );

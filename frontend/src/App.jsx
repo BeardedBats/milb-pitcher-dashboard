@@ -10,6 +10,7 @@ import ReclassifyModal from "./components/ReclassifyModal";
 import SearchBar from "./components/SearchBar";
 import AdaptedResultsTable, { ADAPTED_COLUMNS, ADAPTED_DEFAULT_HIDDEN } from "./components/AdaptedResultsTable";
 import RehabStartsTable, { REHAB_COLUMNS, REHAB_DEFAULT_HIDDEN } from "./components/RehabStartsTable";
+import ExportGameLogsModal from "./components/ExportGameLogsModal";
 import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, fetchRehabStarts, DEFAULT_LEVEL } from "./utils/api";
 import { PITCH_TYPE_FILTERS, PITCH_COLORS, TEAM_FULL_NAMES, PITCHER_RESULTS_COLUMNS } from "./constants";
 import usePersistentState from "./hooks/usePersistentState";
@@ -92,6 +93,8 @@ export default function App() {
   const [spOnly, setSpOnly] = useState(true);
   const [rpOnly, setRpOnly] = useState(false);
   const [splitByTeam, setSplitByTeam] = useState(false);
+  // "Export Game Logs" lightbox (season CSV of the daily performance table).
+  const [showExport, setShowExport] = useState(false);
   // Level + MLB-org filters for the main game log. Level drives which backend
   // pipeline answers (Statcast vs box-score); org is a pure client-side filter
   // on rows that already carry `org`.
@@ -1167,6 +1170,14 @@ export default function App() {
                 Tabs created — a plain click follows them. Middle-click or Ctrl+click to stay on this page.
               </span>
             )}
+            <button
+              type="button"
+              className="export-btn"
+              title="Download the daily performance table for a date range as one CSV"
+              onClick={() => setShowExport(true)}
+            >
+              Export Game Logs
+            </button>
             <a
               className={`create-tabs-btn${!currentTableRows.length ? " create-tabs-btn--disabled" : ""}`}
               href={homePath()}
@@ -1190,6 +1201,17 @@ export default function App() {
               Create Tabs
             </a>
           </div>
+          {showExport && (
+            <ExportGameLogsModal
+              level={level}
+              isStatcastLevel={isStatcastLevel}
+              currentDate={date}
+              spOnly={spOnly}
+              rpOnly={rpOnly}
+              orgFilter={orgFilter}
+              onClose={() => setShowExport(false)}
+            />
+          )}
         </div>
       )}
 

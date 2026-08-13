@@ -25,6 +25,7 @@ Level-aware — the MLB originals assumed one slate a day.
 - `_final_game_pks_for_date` must never hardcode `sportId=1`.
 - Cron + `/api/materialize-*` endpoints fail CLOSED: unset `CRON_SECRET` means 401, not open.
 - `/api/cron/refresh-player-pool` is on-demand only (not in `vercel.json`) — same auth, run by hand after a trade deadline.
+- `materialize-ranges` (every 5 min) also runs, in priority order after the drain: the ledger advance, the Rehab warm, and `_backfill_daily_slates` — a Redis cursor (`backfill:cursor:s{VER}m{METRICS}`) that walks the per-day homepage caches backward from today-8 to `SEASON_START`, ~2 cold days per tick, so the CSV export's day-by-day loop (and deep date paging) hits warm caches. Converged state is one GET per tick; a version bump on either cache restarts the walk.
 
 ## Levels — the core concept
 `backend/levels.py` owns the level registry, the MLB parent-org map, and `(org, level)` team display names. Nothing else hardcodes a sportId.
@@ -67,6 +68,7 @@ Level-aware — the MLB originals assumed one slate a day.
 - `frontend/src/components/PitcherResultsTable.jsx` — Pitcher results on main data page (Statcast levels).
 - `frontend/src/components/AdaptedResultsTable.jsx` — Box-score results table for non-Statcast levels: Date+Lvl | Pitcher | Team | Opp | Dec | IP | H | R | ER | BB | K | HR | BF | P | Str% | GO/AO. No derived metrics beyond Str% and GO/AO.
 - `frontend/src/components/TeamPage.jsx` — Routed per MLB ORG; one table per affiliate, highest level first.
+- `frontend/src/components/ExportGameLogsModal.jsx` + `frontend/src/utils/csv.js` — "Export Game Logs" lightbox (homepage) and the shared CSV serializer. Three export buttons total: homepage (date-range loop over `fetchPitcherResults`, ~4 concurrent, honors level/org/SP/RP filters), player page (serializes `game_log`, zero backend), org page (flattens affiliate blocks). CSVs carry RAW values — numbers not "43%", empty cells not "—"; the backfill cursor in `materialize-ranges` keeps season-long homepage exports on warm caches.
 - `frontend/src/components/RegularSeasonTable.jsx` — Regular Season game-log table SHARED by the player page and the game card (the only game-log table; no postseason/spring/MiLB variants). Holds the view/pitch/hand filters and the Pitch-Mix display modes (below); delegates markup to `GameLogTable`.
 - `frontend/src/components/GameLogTable.jsx` — Generic game-log shell (left box score + pluggable `rightCols`). Optional display-mode hooks (all no-op by default, backward-compatible): `rightCellAttrs(row,i,col)→{className,style}` (heatmap tint), `renderRowDivider(row,i,colSpan)` (full-width injected row; `colSpan` auto-tracks Bars mode), `renderDateBadge(row,i)` (per-game pill), `getRowClassName(row,i)`.
 - `frontend/src/components/PitchMixBar.jsx` — One game's mix as a 100%-width stacked bar (canonical order + faint "other" segment for untracked mass).

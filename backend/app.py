@@ -2038,6 +2038,85 @@ def materialize_status(
     return _json_response(get_range_materialization_status(start_date, end_date), scope="mutation")
 
 
+def _backfill_daily_slates(deadline, max_cold_days=2):
+    """Season-long backfill of the per-day homepage caches, a couple of cold
+    days per 5-minute tick.
+
+    The daily crons warm today and the last week; anything older was cold until
+    someone paged back to it — which is exactly what the CSV export's
+    date-range loop does, one /api/pitcher-results per day. This walks a Redis
+    cursor backward from just behind that warmed window toward SEASON_START,
+    doing the same per-day warms as warmup-daily's recent-slates loop. A
+    past-date agg key never expires (_agg_key_ttl), so each day costs one pass
+    ever; once the cursor reaches the season start the steady state is a single
+    Redis GET per tick.
+
+    The cursor key embeds BOTH cache versions — a bump to either restarts the
+    walk against the new keys instead of declaring stale ones done. A day that
+    errors is logged and passed, not retried forever: these caches also build
+    on demand, so a missed day costs one slow request, while a stuck cursor
+    would cost the whole backfill.
+    """
+    cursor_key = f"backfill:cursor:s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}"
+    if time.time() >= deadline - 30:
+        return {"skipped": "no budget left this tick"}
+    season_start = _season_start(_now_et().year)
+    default_date = get_default_date()
+    # Start just behind warmup-daily's 7-day recent-slates window.
+    start_from = (datetime.strptime(default_date, "%Y-%m-%d")
+                  - timedelta(days=8)).strftime("%Y-%m-%d")
+    cursor = redis_get(cursor_key) or start_from
+    if cursor < season_start:
+        return {"done": True, "cursor": cursor}
+    day_dt = datetime.strptime(cursor, "%Y-%m-%d")
+    levels = ["AAA"] + [c for c in LEVEL_ORDER if c != "AAA"]
+    cold_days, warmed_days = 0, []
+    while day_dt.strftime("%Y-%m-%d") >= season_start:
+        day = day_dt.strftime("%Y-%m-%d")
+        if time.time() >= deadline or cold_days >= max_cold_days:
+            break
+        did_work = False
+        for code in levels:
+            if time.time() >= deadline:
+                did_work = True  # partial day: counts as cold, cursor stays put
+                break
+            try:
+                if is_statcast_level(code):
+                    pitch_key = f"daily_pitch_{code}_{day}"
+                    results_key = f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{day}"
+                    if (get_agg_cache(pitch_key) is not None
+                            and get_agg_cache(results_key) is not None):
+                        continue
+                    did_work = True
+                    get_games(day, code)
+                    set_agg_cache(pitch_key, aggregate_pitch_data(day, None, level=code))
+                    set_agg_cache(results_key,
+                                  aggregate_pitcher_results(day, None, level=code))
+                else:
+                    box_key = (f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}"
+                               f"m{_METRICS_VERSION}_{day}")
+                    if get_agg_cache(box_key) is not None:
+                        continue
+                    did_work = True
+                    get_games(day, code)
+                    rows = get_level_results(day, code)
+                    if rows:
+                        set_agg_cache(box_key, rows)
+            except Exception as e:
+                print(f"[Backfill] {day}/{code} failed: {e}")
+                did_work = True
+        if did_work:
+            cold_days += 1
+            warmed_days.append(day)
+            if time.time() >= deadline:
+                break  # don't advance past a day the deadline cut short
+        day_dt -= timedelta(days=1)
+    new_cursor = day_dt.strftime("%Y-%m-%d")
+    redis_set(cursor_key, new_cursor)
+    return {"done": new_cursor < season_start, "cursor": new_cursor,
+            "warmed_days": warmed_days}
+
+
 @app.get("/api/cron/materialize-ranges")
 def cron_materialize_ranges(request: Request, response: Response, max_jobs: int = Query(1)):
     _set_response_cache(response, "mutation")
@@ -2068,8 +2147,16 @@ def cron_materialize_ranges(request: Request, response: Response, max_jobs: int 
             _rehab_starts_payload(14)
         except Exception as e:
             print(f"[RehabWarm] {e}")
+        # Season backfill of the per-day homepage caches (for the CSV export
+        # and deep date paging). Runs LAST — it is the lowest-priority consumer
+        # of this tick's budget and skips itself when little remains.
+        try:
+            backfill_status = _backfill_daily_slates(deadline)
+        except Exception as e:
+            print(f"[Backfill] {e}")
+            backfill_status = {"error": str(e)}
         return {"status": "ok", "count": len(drained), "drained": drained,
-                "ledger": ledger_status}
+                "ledger": ledger_status, "backfill": backfill_status}
     except Exception as e:
         return _json_response({"error": str(e)}, status_code=500, scope="mutation")
 

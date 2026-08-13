@@ -32,6 +32,7 @@ from data import (
     queue_range_materialization, get_range_materialization_status,
     drain_pending_materializations,
     start_warmup, get_warmup_status, get_agg_cache, set_agg_cache,
+    evict_local_day,
     warmup_range_data, fetch_date, fetch_pitcher_season, compute_player_page,
     invalidate_pitcher_related_caches,
     get_override_version, CARD_SCHEMA_VERSION,
@@ -2056,9 +2057,17 @@ def _backfill_daily_slates(deadline, max_cold_days=2):
     errors is logged and passed, not retried forever: these caches also build
     on demand, so a missed day costs one slow request, while a stuck cursor
     would cost the whole backfill.
+
+    Two invariants keep the long walk safe in ONE warm instance:
+    - evict_local_day after every day that did work. The Redis writes are the
+      product; the L1 copies (the day frame fetch_date pins, the agg row
+      lists) would otherwise accumulate tick after tick until the instance is
+      the season frame — this OOM-killed the cron for real on day one.
+    - the cursor is persisted after EACH completed day, not once at the end,
+      so a killed or timed-out tick keeps the days it finished.
     """
     cursor_key = f"backfill:cursor:s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}"
-    if time.time() >= deadline - 30:
+    if time.time() >= deadline - 45:
         return {"skipped": "no budget left this tick"}
     season_start = _season_start(_now_et().year)
     default_date = get_default_date()
@@ -2108,9 +2117,11 @@ def _backfill_daily_slates(deadline, max_cold_days=2):
         if did_work:
             cold_days += 1
             warmed_days.append(day)
+            evict_local_day(day)
             if time.time() >= deadline:
                 break  # don't advance past a day the deadline cut short
         day_dt -= timedelta(days=1)
+        redis_set(cursor_key, day_dt.strftime("%Y-%m-%d"))
     new_cursor = day_dt.strftime("%Y-%m-%d")
     redis_set(cursor_key, new_cursor)
     return {"done": new_cursor < season_start, "cursor": new_cursor,

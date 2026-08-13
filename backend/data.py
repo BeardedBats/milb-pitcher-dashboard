@@ -2314,6 +2314,25 @@ def set_agg_cache(key, result):
     _index_cache_key(redis_key, key)
 
 
+def evict_local_day(date_str):
+    """Drop one day's PROCESS-LOCAL cache entries — the day frame in `_cache`
+    and the day's agg rows in `_agg_cache` — leaving the Redis copies alone.
+
+    Exists for the season backfill, which warms hundreds of past days from ONE
+    long-lived cron instance. fetch_date pins each past day's full pitch
+    DataFrame in `_cache` forever (correct for request instances, which touch
+    a handful of days), so without eviction the backfill assembles the season
+    frame in L1 a couple of days per tick and the instance OOMs about once an
+    hour. Redis is the durable product of the warm; the next reader of an
+    evicted key repopulates L1 from there (get_agg_cache L2 path / the
+    range_day snapshot).
+    """
+    _cache.pop(date_str, None)
+    suffix = f"_{date_str}"
+    for key in [k for k in _agg_cache if k.endswith(suffix)]:
+        _agg_cache.pop(key, None)
+
+
 def invalidate_pitcher_related_caches(pitcher_ids):
     """Clear stable caches for specific pitchers after data changes."""
     pid_set = {int(pid) for pid in (pitcher_ids or []) if pid is not None}

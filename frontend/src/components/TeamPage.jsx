@@ -1,5 +1,4 @@
 import React, { useState, useMemo } from "react";
-import { PITCH_COLORS } from "../constants";
 import { fetchOrgPage, fetchWarmupStatus } from "../utils/api";
 import { buildPlayerHash } from "../utils/navigation";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
@@ -7,48 +6,71 @@ import WarmupStalled from "./WarmupStalled";
 import LoadError from "./LoadError";
 
 // Team pages route per MLB ORG (LAD, DET, ...), not per affiliate: one table
-// per affiliate stacked highest level first (AAA → AA → A+ → A → R), formatted
-// like the main table's team-separation mode.
+// per affiliate stacked highest level first (AAA → AA → A+ → A → R).
 //
-// Only the AAA block has Statcast columns. Everything below it is box-score
-// only, so those blocks render the adapted column set.
-
-// AAA has Statcast, so its block keeps CSW%/Whiffs. Every level below is box
-// score only and gets the adapted columns instead.
-const STATCAST_COLS = [
-  { key: "pitcher", label: "Pitcher" },
-  { key: "hand", label: "Hand" },
-  { key: "games", label: "G" },
+// ONE column set for every level. The base of every row is the official
+// box-score season line (ERA/WHIP/GS/GO-AO/Strike% exist at all levels); the
+// Statcast-only columns (SwStr%, CSW%, Velo/EXT/iVB) are an overlay the
+// backend applies to AAA rows and render as hyphens everywhere else.
+//
+// `divider: true` draws the block boundary AFTER that column.
+const COLS = [
+  { key: "pitcher", label: "Pitcher", align: "left" },
+  { key: "last_game", label: "Last Game", align: "left" },
   { key: "ip", label: "IP" },
+  { key: "games", label: "G" },
+  { key: "games_started", label: "GS", divider: true },
+  { key: "era", label: "ERA" },
+  { key: "whip", label: "WHIP" },
+  { key: "bb_pct", label: "BB%" },
+  { key: "k_pct", label: "K%", divider: true },
   { key: "hits", label: "H" },
   { key: "bbs", label: "BB" },
   { key: "ks", label: "K" },
   { key: "er", label: "ER" },
   { key: "hrs", label: "HR" },
+  { key: "go_ao", label: "GO/AO", divider: true },
+  { key: "swstr_pct", label: "SwStr%" },
   { key: "csw_pct", label: "CSW%" },
-  { key: "whiffs", label: "Whiffs" },
-  { key: "pitches", label: "Pitches" },
+  { key: "strike_pct", label: "Strike%", divider: true },
+  { key: "velo", label: "Velo" },
+  { key: "ext", label: "EXT" },
+  { key: "ivb", label: "iVB" },
 ];
 
-const BOXSCORE_COLS = [
-  { key: "pitcher", label: "Pitcher" },
-  { key: "games", label: "G" },
-  { key: "ip", label: "IP" },
-  { key: "hits", label: "H" },
-  { key: "runs", label: "R" },
-  { key: "er", label: "ER" },
-  { key: "bbs", label: "BB" },
-  { key: "ks", label: "K" },
-  { key: "hrs", label: "HR" },
-  { key: "batters_faced", label: "BF" },
-  { key: "pitches", label: "P" },
-  { key: "strike_pct", label: "Str%" },
-  { key: "go_ao", label: "GO/AO" },
-];
+// "70.1" innings must outrank "9.2" — string compare only reads the first
+// digit, which is the bug this replaces.
+function ipToNumeric(ip) {
+  if (ip == null) return null;
+  const [whole, thirds] = String(ip).split(".");
+  return (parseInt(whole, 10) || 0) + (parseInt(thirds, 10) || 0) / 3;
+}
 
-function AffiliateTable({ block, onPlayerClick }) {
-  const cols = block.statcast ? STATCAST_COLS : BOXSCORE_COLS;
-  const [sortCol, setSortCol] = useState(null);
+// BB% / K% are derived here rather than shipped: every row already carries
+// bbs/ks/batters_faced, and one source of truth beats three cached copies.
+function pctOfBF(row, key) {
+  const bf = row.batters_faced;
+  if (!bf) return null;
+  const num = key === "bb_pct" ? row.bbs : row.ks;
+  if (num == null) return null;
+  return (num / bf) * 100;
+}
+
+function sortValue(row, key) {
+  if (key === "ip") return ipToNumeric(row.ip);
+  if (key === "bb_pct" || key === "k_pct") return pctOfBF(row, key);
+  // era/whip arrive as strings from the stats API ("3.86").
+  if (key === "era" || key === "whip") {
+    const n = parseFloat(row[key]);
+    return Number.isNaN(n) ? null : n;
+  }
+  return row[key];
+}
+
+function AffiliateTable({ block, onPlayerClick, spOnly, rpOnly }) {
+  // Most recent appearance on top — "who is pitching lately" is the question
+  // an org page opens with.
+  const [sortCol, setSortCol] = useState("last_game");
   const [sortDir, setSortDir] = useState("desc");
 
   const handleSort = (col) => {
@@ -57,30 +79,47 @@ function AffiliateTable({ block, onPlayerClick }) {
   };
 
   const sorted = useMemo(() => {
-    const rows = block.rows || [];
+    let rows = block.rows || [];
+    if (spOnly) rows = rows.filter(r => r.role === "SP");
+    else if (rpOnly) rows = rows.filter(r => r.role === "RP");
     if (!sortCol) return rows;
     return [...rows].sort((a, b) => {
-      const va = a[sortCol], vb = b[sortCol];
+      const va = sortValue(a, sortCol), vb = sortValue(b, sortCol);
       if (va == null) return 1;
       if (vb == null) return -1;
-      if (typeof va === "string") return sortDir === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+      if (typeof va === "string" && typeof vb === "string") {
+        return sortDir === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+      }
       return sortDir === "asc" ? va - vb : vb - va;
     });
-  }, [block.rows, sortCol, sortDir]);
+  }, [block.rows, sortCol, sortDir, spOnly, rpOnly]);
 
   const fmtCell = (row, col) => {
-    const val = row[col.key];
-    if (val == null) return "—";
-    if (col.key === "pitcher") {
+    const key = col.key;
+    if (key === "pitcher") {
+      const val = row.pitcher;
       if (onPlayerClick && row.pitcher_id) {
         const playerHref = `#${buildPlayerHash(row.pitcher_id)}`;
         return <a href={playerHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ color: "inherit", textDecoration: "none" }}>{val}</a>;
       }
       return val;
     }
-    if (col.key === "strike_pct") return `${val}%`;
-    if (col.key === "go_ao") return Number(val).toFixed(2);
-    if (typeof val === "number" && col.key.includes("pct")) return val.toFixed(1);
+    if (key === "last_game") {
+      // "07-08 (AAA)" — the level tag is the block's level, since each table
+      // is one affiliate.
+      const d = row.last_game;
+      return d ? `${String(d).slice(5, 10)} (${block.level})` : "—";
+    }
+    if (key === "bb_pct" || key === "k_pct") {
+      const v = pctOfBF(row, key);
+      return v == null ? "—" : `${v.toFixed(1)}%`;
+    }
+    const val = row[key];
+    if (val == null || val === "") return "—";
+    // Whole numbers read faster in a rate column; the decimal was noise.
+    if (key === "swstr_pct" || key === "csw_pct" || key === "strike_pct") return `${Math.round(val)}%`;
+    if (key === "go_ao") return Number(val).toFixed(2);
+    if (key === "velo" || key === "ext" || key === "ivb") return Number(val).toFixed(1);
     return val;
   };
 
@@ -92,15 +131,24 @@ function AffiliateTable({ block, onPlayerClick }) {
         <span className="org-affiliate-abbrev">{block.team}</span>
       </div>
       {sorted.length === 0 ? (
-        <div className="no-data" style={{ padding: 24 }}>No pitchers with data at this level.</div>
+        <div className="no-data" style={{ padding: 24 }}>
+          {(block.rows || []).length === 0
+            ? "No pitchers with data at this level."
+            : `No ${spOnly ? "starters" : "relievers"} at this level.`}
+        </div>
       ) : (
         <div className="table-card">
           <div className="table-wrapper">
             <table>
               <thead>
                 <tr>
-                  {cols.map(c => (
-                    <th key={c.key} onClick={() => handleSort(c.key)} style={{ cursor: "pointer", whiteSpace: "nowrap" }}>
+                  {COLS.map(c => (
+                    <th
+                      key={c.key}
+                      onClick={() => handleSort(c.key)}
+                      className={c.divider ? "col-divider-right" : ""}
+                      style={{ cursor: "pointer", whiteSpace: "nowrap", textAlign: c.align || "right" }}
+                    >
                       {c.label}{sortCol === c.key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
                     </th>
                   ))}
@@ -109,12 +157,19 @@ function AffiliateTable({ block, onPlayerClick }) {
               <tbody>
                 {sorted.map((row, i) => (
                   <tr key={`${row.pitcher_id}-${i}`}>
-                    {cols.map(c => (
+                    {COLS.map(c => (
                       <td key={c.key}
-                        className={[c.key === "pitcher" ? "pitcher-name-cell" : "", c.key === "pitcher" && row.mlb_exp ? "mlb-exp" : ""].filter(Boolean).join(" ")}
+                        className={[
+                          c.key === "pitcher" ? "pitcher-name-cell" : "",
+                          c.key === "pitcher" && row.mlb_exp ? "mlb-exp" : "",
+                          c.divider ? "col-divider-right" : "",
+                        ].filter(Boolean).join(" ")}
                         onClick={c.key === "pitcher" ? (e) => onPlayerClick(row.pitcher_id, row.pitcher, e) : undefined}
                         onMouseDown={c.key === "pitcher" ? (e) => { if (e.button === 1) { e.preventDefault(); onPlayerClick(row.pitcher_id, row.pitcher, e); } } : undefined}
-                        style={c.key === "pitcher" ? { cursor: "pointer", color: "var(--name)" } : c.key === "pitch_name" ? { color: PITCH_COLORS[row.pitch_name] || "var(--text)" } : {}}
+                        style={{
+                          textAlign: c.align || "right",
+                          ...(c.key === "pitcher" ? { cursor: "pointer", color: "var(--name)" } : {}),
+                        }}
                       >
                         {fmtCell(row, c)}
                       </td>
@@ -132,6 +187,10 @@ function AffiliateTable({ block, onPlayerClick }) {
 
 export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
   const org = (teamAbbrev || "").toUpperCase();
+  // Starters are what this page is opened for — SP Only defaults on. The two
+  // toggles are mutually exclusive, matching the MLB dashboard's pair.
+  const [spOnly, setSpOnly] = useState(true);
+  const [rpOnly, setRpOnly] = useState(false);
 
   const { data, loading, message: loadMsg, error, stalled, reload } = useWarmupBackedResource({
     key: [org],
@@ -149,6 +208,22 @@ export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
       <div className="page-header">
         <a className="back-btn" href={window.location.pathname} rel="nofollow" onClick={(e) => { if (!e.ctrlKey && !e.metaKey) { e.preventDefault(); onBack(); } }} style={{ textDecoration: "none" }}>← Back</a>
         <h2 className="page-title">{org} System</h2>
+        <label className="toggle-label" style={{ marginLeft: "auto" }}>
+          <input
+            type="checkbox"
+            checked={spOnly}
+            onChange={(e) => { setSpOnly(e.target.checked); if (e.target.checked) setRpOnly(false); }}
+          />
+          <span>SP Only</span>
+        </label>
+        <label className="toggle-label">
+          <input
+            type="checkbox"
+            checked={rpOnly}
+            onChange={(e) => { setRpOnly(e.target.checked); if (e.target.checked) setSpOnly(false); }}
+          />
+          <span>RP Only</span>
+        </label>
       </div>
       {/* error BEFORE the empty state: a failed request is not an empty org. */}
       {error ? (
@@ -165,7 +240,13 @@ export default function TeamPage({ teamAbbrev, onPlayerClick, onBack }) {
         <div className="no-data">No affiliates found for {org}.</div>
       ) : (
         affiliates.map(block => (
-          <AffiliateTable key={`${block.level}-${block.team}`} block={block} onPlayerClick={onPlayerClick} />
+          <AffiliateTable
+            key={`${block.level}-${block.team}`}
+            block={block}
+            onPlayerClick={onPlayerClick}
+            spOnly={spOnly}
+            rpOnly={rpOnly}
+          />
         ))
       )}
     </div>

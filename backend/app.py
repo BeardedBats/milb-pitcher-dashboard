@@ -55,6 +55,7 @@ from levels import (
 )
 import ledger
 from boxscore_levels import (
+    get_team_last_games,
     get_level_results, get_multi_level_game_log, current_level, get_person_info,
     get_team_season_pitchers, get_all_milb_pitchers, cached_milb_pitchers,
     enrich_log_with_pitch_metrics, get_game_pitch_metrics,
@@ -1663,6 +1664,50 @@ def _org_agg_key(org, start_date, end_date):
     return f"org_{org}_s{CARD_SCHEMA_VERSION}_{start_date}_{end_date}"
 
 
+def _overlay_statcast_on_block(block, statcast_rows, pitch_rows):
+    """Merge Statcast season extras onto an AAA block's box-score base rows.
+
+    The box rows stay the base ON PURPOSE: they carry the official season line
+    (ERA, WHIP, GS, GO/AO, Strike%, batters faced) that the Statcast fold does
+    not track. The overlay adds only what box scores cannot know — per-pitch
+    rates and the primary fastball's flight — so every level shares one row
+    shape and AAA simply has more of it filled in.
+    """
+    by_pid = {int(r["pitcher_id"]): r for r in (statcast_rows or []) if r.get("pitcher_id") is not None}
+    fb_by_pid = {}
+    for r in (pitch_rows or []):
+        if r.get("pitcher_id") is None:
+            continue
+        pt = r.get("pitch_type")
+        # Four-seamer preferred, sinker fallback — same rule as the Rehab Velo
+        # column. Cutters/splitters deliberately excluded.
+        rank = 0 if pt in ("FF", "FA") else 1 if pt in ("SI", "FT") else None
+        if rank is None:
+            continue
+        pid = int(r["pitcher_id"])
+        cur = fb_by_pid.get(pid)
+        if cur is None or rank < cur[0]:
+            fb_by_pid[pid] = (rank, r)
+    matched = 0
+    for row in block["rows"]:
+        try:
+            pid = int(row.get("pitcher_id"))
+        except (TypeError, ValueError):
+            continue
+        sc = by_pid.get(pid)
+        if sc:
+            matched += 1
+            pitches = sc.get("pitches") or 0
+            row["csw_pct"] = sc.get("csw_pct")
+            row["swstr_pct"] = round(sc["whiffs"] / pitches * 100, 1) if pitches else None
+        fb = fb_by_pid.get(pid)
+        if fb:
+            row["velo"] = fb[1].get("velo")
+            row["ext"] = fb[1].get("ext")
+            row["ivb"] = fb[1].get("ivb")
+    return matched > 0
+
+
 def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
     """Build one org's affiliate blocks. Returns (payload, statcast_pending).
 
@@ -1703,6 +1748,33 @@ def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
             "rows": rows,
         })
 
+    # "Last Game" for every row — one batched hydrate call per affiliate,
+    # cached alongside the season rows. Failure degrades to a hyphen column,
+    # never a failed page.
+    for block in blocks:
+        try:
+            last = get_team_last_games(
+                block["team_id"], block["level"], season_year,
+                [r.get("pitcher_id") for r in block["rows"]],
+            )
+        except Exception as e:
+            print(f"[OrgPage] last-game lookup failed for {block['team']}: {e}")
+            last = {}
+        for r in block["rows"]:
+            r["last_game"] = last.get(str(r.get("pitcher_id")))
+
+    # Season fastball flight (velo/ext/ivb) for the AAA overlay. Ledger first;
+    # the per-team agg key warmup-daily-2 writes is the fallback. None is fine —
+    # those three columns just render as hyphens until the ledger catches up.
+    def _aaa_pitch_rows(team):
+        try:
+            rows = ledger.team_season_rows(team, "pitch-data")
+            if rows is not None:
+                return rows
+        except Exception as e:
+            print(f"[OrgPage] pitch-data ledger read failed for {team}: {e}")
+        return get_agg_cache(f"team_{team}_pitch-data_{start_date}_{end_date}")
+
     # Optional AAA upgrade: richer per-pitch columns (CSW%, whiffs) when the
     # season range is materialized. Never blocks the response.
     #
@@ -1731,10 +1803,8 @@ def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
     if aaa_blocks and aaa_rows_by_team is not None:
         # Rows already folded by the caller — no range pass at all.
         for block in aaa_blocks:
-            rows = aaa_rows_by_team.get(block["team"])
-            if rows:
-                block["rows"] = tag_mlb_experience(rows)
-                block["statcast"] = True
+            block["statcast"] = _overlay_statcast_on_block(
+                block, aaa_rows_by_team.get(block["team"]), _aaa_pitch_rows(block["team"]))
     elif aaa_blocks:
         accs = {b["team"]: new_results_accumulator() for b in aaa_blocks}
 
@@ -1754,10 +1824,9 @@ def _build_org_page_payload(org, start_date, end_date, aaa_rows_by_team=None):
             complete = False
         if complete:
             for block in aaa_blocks:
-                rows = finalize_pitcher_results(accs[block["team"]])
-                if rows:
-                    block["rows"] = tag_mlb_experience(rows)
-                    block["statcast"] = True
+                block["statcast"] = _overlay_statcast_on_block(
+                    block, finalize_pitcher_results(accs[block["team"]]),
+                    _aaa_pitch_rows(block["team"]))
         else:
             statcast_pending = True
             # Nothing else re-queues a range that lapses mid-day: the 5-minute

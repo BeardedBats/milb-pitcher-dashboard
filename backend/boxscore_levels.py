@@ -903,6 +903,74 @@ _person_cache = {}
 # A player's name and throwing hand don't change — cache for a week.
 _PERSON_TTL = 7 * 24 * 3600
 
+# Batched people lookup with a hydrated game log. ONE request answers "when
+# did each of these pitchers last appear for this team" for a whole affiliate;
+# the alternative (a gameLog call per pitcher) is ~40 requests per affiliate,
+# which at 30 orgs x ~7 affiliates is far past what the nightly org warm can
+# afford. The raw response is large (full logs for every pitcher) but only the
+# derived {pitcher_id: date} map is kept — same rule as the box caches: cache
+# DERIVED rows, never raw payloads.
+_PEOPLE_GAMELOG_URL = (
+    "https://statsapi.mlb.com/api/v1/people?personIds={ids}"
+    "&hydrate=stats(group=[pitching],type=[gameLog],season={season},sportId={sport_id})"
+)
+_last_game_cache = {}
+_LAST_GAME_TTL = 1800  # matches the team-season rows these ride along with
+
+
+def get_team_last_games(team_id, level, season, pitcher_ids):
+    """{pitcher_id(str): 'YYYY-MM-DD'} of each pitcher's last game FOR THIS TEAM.
+
+    Filtered to this team on purpose: the row this feeds lives on one
+    affiliate's table, so a promoted or traded pitcher shows his last game
+    here, not his most recent game elsewhere in the org.
+    """
+    team_id, season = int(team_id), int(season)
+    ids = sorted({int(p) for p in pitcher_ids if p is not None})
+    if not ids:
+        return {}
+    level = normalize_level(level)
+    return _two_tier(
+        _last_game_cache, (team_id, season),
+        f"{_MILB_CACHE_PREFIX}:lastgame:{level}:{team_id}:{season}", _LAST_GAME_TTL,
+        lambda: _build_team_last_games(team_id, level, season, ids),
+    ) or {}
+
+
+def _build_team_last_games(team_id, level, season, ids):
+    cfg = LEVELS[normalize_level(level)]
+    out = {}
+    # people?personIds= caps around 100 ids per request; an affiliate's season
+    # roster of pitchers is ~40-60, so this is one chunk in practice.
+    for i in range(0, len(ids), 80):
+        chunk = ids[i:i + 80]
+        url = _PEOPLE_GAMELOG_URL.format(
+            ids=",".join(str(p) for p in chunk),
+            season=season, sport_id=cfg["sport_id"],
+        )
+        try:
+            resp = requests.get(url, timeout=25)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            print(f"[BoxLevels] last-game hydrate failed for {team_id}: {e}")
+            continue
+        for person in data.get("people", []):
+            pid = person.get("id")
+            if pid is None:
+                continue
+            best = None
+            for group in person.get("stats", []) or []:
+                for split in group.get("splits", []) or []:
+                    if ((split.get("team") or {}).get("id")) != team_id:
+                        continue
+                    date = split.get("date")
+                    if date and (best is None or date > best):
+                        best = date
+            if best:
+                out[str(pid)] = best
+    return out
+
 
 def get_person_info(pitcher_id):
     """Name + throwing hand from the MLB people endpoint.

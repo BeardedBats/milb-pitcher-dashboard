@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 import data as D
+import boxscore_levels as B
 import app as A
 
 
@@ -59,6 +60,13 @@ def harness(monkeypatch):
 
 
 def test_backfill_evicts_local_day_and_keeps_redis(harness):
+    # Pre-seed the per-game L1 dicts the box path fills in production — raw
+    # box payloads chief among them; the walk must clear them all.
+    D._boxscore_cache[999001] = (time.time(), {"er": 1})
+    B._box_cache[999001] = (time.time(), True, {"huge": "raw payload"})
+    B._rows_cache[(999001, "AA", True)] = (time.time(), [{"pitcher_id": 3}])
+    B._pm_cache[999001] = (time.time(), {3: {"csw": 30}})
+
     result = A._backfill_daily_slates(deadline=time.time() + 3600, max_cold_days=3)
 
     assert result["warmed_days"] == DAYS_DESC
@@ -66,6 +74,11 @@ def test_backfill_evicts_local_day_and_keeps_redis(harness):
     for day in DAYS_DESC:
         assert day not in D._cache
         assert not any(k.endswith(f"_{day}") for k in D._agg_cache)
+    # ...the per-game L1 dicts are empty...
+    assert not D._boxscore_cache
+    assert not B._box_cache
+    assert not B._rows_cache
+    assert not B._pm_cache
     # ...while the Redis copies (the product of the warm) survive.
     assert any(k.startswith("agg:") for k in harness["redis"])
 

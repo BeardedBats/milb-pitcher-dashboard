@@ -194,6 +194,22 @@ def _two_tier(l1, l1_key, redis_key, ttl, compute):
     return value
 
 
+def evict_local_transients():
+    """Clear this module's PER-GAME L1 dicts, leaving Redis (L2) intact.
+
+    For long walks — the season backfill touches every game of every backfilled
+    day from ONE warm cron instance. _box_cache holds RAW box payloads, the
+    exact payloads the module rules say never to persist, and it grows by a
+    full slate per warmed day; _rows_cache and _pm_cache grow alongside it.
+    Their derived values all live in Redis behind _two_tier, so the only cost
+    of clearing is one L2 read if the same game is touched again here.
+    """
+    with _box_lock:
+        _box_cache.clear()
+    _rows_cache.clear()
+    _pm_cache.clear()
+
+
 def _num(v, default=0):
     if v is None:
         return default

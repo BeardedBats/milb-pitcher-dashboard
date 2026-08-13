@@ -2250,6 +2250,10 @@ def _agg_key_uses_redis_l2(key):
         # asof-today season totals were L1-only, so every fresh serverless
         # instance recomputed them; their short live TTL makes Redis safe.
         or key.startswith("season_totals_")
+        # The rehab payload was also L1-only, which on serverless meant every
+        # cold instance re-ran the full IL sweep. The cron re-warms it, but
+        # the warm is worthless unless instances can actually SHARE it.
+        or key.startswith("rehab_starts_")
     )
 
 

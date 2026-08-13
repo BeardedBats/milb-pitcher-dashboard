@@ -1528,9 +1528,11 @@ def team_pitchers(response: Response, team: str = Query(...), start_date: str = 
 _REHAB_ENRICH_BUDGET_S = 40
 
 
-@app.get("/api/rehab-starts")
-def rehab_starts(response: Response, days: int = Query(14)):
+def _rehab_starts_payload(days=14):
     """MLB pitchers on an injured list who have made a minor-league START recently.
+
+    Shared by the endpoint and the cron warm below. Cache-first: a hit is a
+    dict lookup, so callers may invoke this speculatively.
 
     The obvious implementation — walk every IL pitcher's game log — is ~6 calls
     per player across levels. This funnels instead, cheapest filter first:
@@ -1545,7 +1547,6 @@ def rehab_starts(response: Response, days: int = Query(14)):
     Steps 1-2 are shared and cached, so the per-player cost lands on a list that
     is typically a few dozen long rather than several hundred.
     """
-    _set_response_cache(response, "live")
     days = max(1, min(int(days or 14), 45))
     today = _now_et().date()
     start_date = (today - timedelta(days=days)).isoformat()
@@ -1658,6 +1659,12 @@ def rehab_starts(response: Response, days: int = Query(14)):
     payload = {"start_date": start_date, "end_date": end_date, "pitchers": rows}
     set_agg_cache(cache_key, payload)
     return payload
+
+
+@app.get("/api/rehab-starts")
+def rehab_starts(response: Response, days: int = Query(14)):
+    _set_response_cache(response, "live")
+    return _rehab_starts_payload(days)
 
 
 def _org_agg_key(org, start_date, end_date):
@@ -2050,6 +2057,17 @@ def cron_materialize_ranges(request: Request, response: Response, max_jobs: int 
         except Exception as e:
             print(f"[Ledger] advance failed: {e}")
             ledger_status = {"error": str(e)}
+        # Keep the Rehab page warm. Its key rolls hourly (it embeds today's
+        # date and takes the live TTL), and the build is the most
+        # request-hostile sweep in the app — rosters, six per-level scans,
+        # game logs, then play-by-play enrichment. Calling the builder here is
+        # a dict lookup while the cache holds and at most one rebuild per
+        # hour when it lapses; during game hours that also folds in starts
+        # that completed since the last pass.
+        try:
+            _rehab_starts_payload(14)
+        except Exception as e:
+            print(f"[RehabWarm] {e}")
         return {"status": "ok", "count": len(drained), "drained": drained,
                 "ledger": ledger_status}
     except Exception as e:

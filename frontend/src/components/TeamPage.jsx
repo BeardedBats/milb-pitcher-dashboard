@@ -100,7 +100,10 @@ function AffiliateTable({ block, onPlayerClick, spOnly, rpOnly }) {
       const val = row.pitcher;
       if (onPlayerClick && row.pitcher_id) {
         const playerHref = `#${buildPlayerHash(row.pitcher_id)}`;
-        return <a href={playerHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ color: "inherit", textDecoration: "none" }}>{val}</a>;
+        // Plain clicks preventDefault and bubble to the row handler; the
+        // new-tab gestures (ctrl/cmd/middle) stay native on the anchor and
+        // stop propagating so the row doesn't open a second copy.
+        return <a href={playerHref} rel="nofollow" onClick={(e) => { if (e.ctrlKey || e.metaKey) { e.stopPropagation(); } else { e.preventDefault(); } }} onMouseDown={(e) => { if (e.button === 1) e.stopPropagation(); }} onAuxClick={(e) => { if (e.button === 1) e.stopPropagation(); }} style={{ color: "inherit", textDecoration: "none" }}>{val}</a>;
       }
       return val;
     }
@@ -155,8 +158,21 @@ function AffiliateTable({ block, onPlayerClick, spOnly, rpOnly }) {
                 </tr>
               </thead>
               <tbody>
-                {sorted.map((row, i) => (
-                  <tr key={`${row.pitcher_id}-${i}`}>
+                {sorted.map((row, i) => {
+                  // The whole row opens the player page, not just the name —
+                  // a stat cell is as natural a click target as the pitcher.
+                  const canOpen = Boolean(onPlayerClick && row.pitcher_id);
+                  const open = (e) => { if (canOpen) onPlayerClick(row.pitcher_id, row.pitcher, e); };
+                  return (
+                  <tr
+                    key={`${row.pitcher_id}-${i}`}
+                    className={canOpen ? "clickable-row" : undefined}
+                    onClick={canOpen ? open : undefined}
+                    // Middle-click opens a new tab; preventDefault on mousedown
+                    // suppresses the browser's autoscroll widget first.
+                    onMouseDown={canOpen ? (e) => { if (e.button === 1) e.preventDefault(); } : undefined}
+                    onAuxClick={canOpen ? (e) => { if (e.button === 1) { e.preventDefault(); open(e); } } : undefined}
+                  >
                     {COLS.map(c => (
                       <td key={c.key}
                         className={[
@@ -164,18 +180,17 @@ function AffiliateTable({ block, onPlayerClick, spOnly, rpOnly }) {
                           c.key === "pitcher" && row.mlb_exp ? "mlb-exp" : "",
                           c.divider ? "col-divider-right" : "",
                         ].filter(Boolean).join(" ")}
-                        onClick={c.key === "pitcher" ? (e) => onPlayerClick(row.pitcher_id, row.pitcher, e) : undefined}
-                        onMouseDown={c.key === "pitcher" ? (e) => { if (e.button === 1) { e.preventDefault(); onPlayerClick(row.pitcher_id, row.pitcher, e); } } : undefined}
                         style={{
                           textAlign: c.align || "right",
-                          ...(c.key === "pitcher" ? { cursor: "pointer", color: "var(--name)" } : {}),
+                          ...(c.key === "pitcher" ? { color: "var(--name)" } : {}),
                         }}
                       >
                         {fmtCell(row, c)}
                       </td>
                     ))}
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

@@ -321,6 +321,7 @@ a.pitcher-name.pitcher-sp-highlight { color: #ffc277; }
 .table-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 10px;
   align-self: stretch;
   padding: 10px 0 0;
   background: transparent;
@@ -1840,3 +1841,67 @@ canvas { display: block; border: none; border-radius: var(--radius-sm); }
   vertical-align: middle;
 }
 .rehab-empty { text-align: center; padding: 40px; color: var(--text-dim); }
+
+/* ── Export Game Logs (CSV) ── */
+.export-backdrop {
+  position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+  animation: pbpFadeIn 0.12s ease-out;
+}
+.export-panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); min-width: 380px; max-width: 480px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  animation: pbpSlideIn 0.15s ease-out;
+}
+.export-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 18px; border-bottom: 1px solid var(--border);
+}
+.export-title { font-size: 18px; font-weight: 700; color: var(--text-bright); }
+.export-close {
+  background: none; border: none; color: var(--text-dim); font-size: 22px;
+  cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.export-close:hover { color: var(--text); }
+.export-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.export-note { font-size: 13px; color: var(--text-dim); line-height: 1.5; }
+.export-note b { color: var(--text); }
+.export-range-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.export-range-row input[type="date"] {
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text);
+  font-family: inherit; font-size: 13px; padding: 6px 8px;
+  color-scheme: dark;
+}
+.export-day-count { font-size: 12px; color: var(--text-dim); padding-bottom: 8px; }
+.export-progress { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
+.export-progress-track {
+  flex: 1; height: 6px; border-radius: 3px;
+  background: var(--surface2); overflow: hidden;
+}
+.export-progress-fill {
+  height: 100%; background: var(--accent);
+  transition: width 0.2s ease;
+}
+.export-error { font-size: 12px; color: #FF839B; line-height: 1.4; }
+.export-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.export-btn {
+  display: inline-block;
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit; font-size: 13px; font-weight: 600;
+  padding: 7px 14px; text-decoration: none;
+  transition: all 0.15s;
+}
+.export-btn:hover:not(:disabled) {
+  background: var(--hover-tint); color: var(--text-bright);
+  box-shadow: 0 0 10px var(--accent-glow);
+}
+.export-btn:disabled { cursor: default; opacity: 0.45; }
+.export-btn-cancel { border-color: #FF839B; color: #FF839B; }
+.export-btn-cancel:hover:not(:disabled) { box-shadow: 0 0 10px rgba(255,131,155,0.35); }

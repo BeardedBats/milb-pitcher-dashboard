@@ -9,6 +9,7 @@ import ResultsTable from "./ResultsTable";
 import UsageTable from "./UsageTable";
 import { classifyPitchResult, isRunScored, isStrikeoutPitch, isBallInPlay, classifyBIPQuality, RESULT_FILTER_OPTIONS, RESULT_QUICK_ACTIONS } from "../utils/pitchFilters";
 import { fetchPlayerPageResource, fetchWarmupStatus } from "../utils/api";
+import { downloadCsv, csvSlug } from "../utils/csv";
 import { buildCardHash } from "../utils/navigation";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
 import WarmupStalled from "./WarmupStalled";
@@ -190,6 +191,35 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
   const handlePbpClick = () => {
     if (pbpDisabled || !pbpGamePk || !pbpGameDate) return;
     onGameClick(pbpGameDate, pitcherId, pbpGamePk);
+  };
+
+  // Season game log → one CSV. Raw values (26.3, not "26%"), empty cells for
+  // fields a box-score-level game doesn't carry.
+  const exportGameLog = () => {
+    if (!sortedLog.length) return;
+    const cols = [
+      { key: "date", label: "Date" },
+      { key: "level", label: "Level" },
+      { key: "team", label: "Team" },
+      { key: "opponent", label: "Opp", value: r => (r.home === false || (r.team && r.home_team && r.team !== r.home_team) ? "@ " : "") + (r.opponent || "") },
+      { key: "decision", label: "Dec" },
+      { key: "ip", label: "IP" },
+      { key: "runs", label: "R" },
+      { key: "er", label: "ER" },
+      { key: "hits", label: "H" },
+      { key: "bbs", label: "BB" },
+      { key: "ks", label: "K" },
+      { key: "whiffs", label: "Whiffs" },
+      { key: "swstr_pct", label: "SwStr%" },
+      { key: "csw_pct", label: "CSW%" },
+      { key: "strike_pct", label: "Strike%" },
+      { key: "two_str_pct", label: "2Str%" },
+      { key: "par_pct", label: "PAR%", value: r => (r.two_strike_pas > 0 && r.ks != null ? Math.round((r.ks / r.two_strike_pas) * 100) : "") },
+      { key: "pitches", label: "Pitches" },
+      { key: "hrs", label: "HR" },
+    ];
+    const season = (sortedLog[0].date || "").slice(0, 4) || "season";
+    downloadCsv(`game-log_${csvSlug(data?.info?.name || pitcherId)}_${season}.csv`, cols, sortedLog);
   };
 
   // Before the "Player not found" branch below — a failed request is not a
@@ -456,6 +486,18 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
 
         {!hasData && <div className="pp-empty">No Game Results</div>}
       </div>
+      {hasData && (
+        <div className="table-actions" style={{ justifyContent: "flex-end", marginTop: 12 }}>
+          <button
+            type="button"
+            className="export-btn"
+            title="Download this pitcher's season game log as a CSV"
+            onClick={exportGameLog}
+          >
+            Export Game Log
+          </button>
+        </div>
+      )}
     </div>
   );
 }

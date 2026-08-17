@@ -36,6 +36,20 @@ STATCAST_LEVELS = ("AAA", "AFL")
 
 DEFAULT_LEVEL = "AAA"
 
+# Pseudo-level for the daily leaderboard's "All Levels" filter: every level's
+# pitchers on one date, in one table.
+#
+# It is NOT a member of LEVELS and never will be — it has no sportId, no
+# schedule and no team map, so nothing that resolves a level can accept it.
+# That makes the ordering rule below load-bearing: normalize_level() coerces
+# anything it does not recognise to AAA, so an endpoint that normalizes BEFORE
+# asking is_all_levels() answers an all-levels request with Triple-A only, and
+# does it silently. Guard first, normalize second.
+ALL_LEVELS = "ALL"
+ALL_LEVELS_LABEL = "All Levels"
+
+_ALL_LEVEL_ALIASES = frozenset({"ALL", "ALL LEVELS", "ALL-LEVELS", "ALL_LEVELS"})
+
 SPORT_ID_TO_LEVEL = {cfg["sport_id"]: code for code, cfg in LEVELS.items()}
 
 _SCHEDULE_URL = (
@@ -47,8 +61,18 @@ _SCHEDULE_URL = (
 _TEAMS_URL = "https://statsapi.mlb.com/api/v1/teams?sportId={sport_id}&season={season}"
 
 
+def is_all_levels(level):
+    """True for the "All Levels" pseudo-level. Ask this BEFORE normalize_level
+    — see the note on ALL_LEVELS for why the order matters."""
+    return str(level or "").strip().upper() in _ALL_LEVEL_ALIASES
+
+
 def normalize_level(level):
-    """Coerce any user/query input to a known level code (default AAA)."""
+    """Coerce any user/query input to a known level code (default AAA).
+
+    Deliberately has no idea about ALL_LEVELS: "every level" is not a level,
+    and returning it here would hand a sportId lookup something with no sportId.
+    """
     if not level:
         return DEFAULT_LEVEL
     code = str(level).strip().upper()

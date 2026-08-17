@@ -1,4 +1,4 @@
-import { fetchPitcherSeasonTotals, fetchOrgPage, fetchPlayerPageResource } from "../api";
+import { fetchPitcherSeasonTotals, fetchOrgPage, fetchPlayerPageResource, fetchPitcherResults, isAllLevels, ALL_LEVELS } from "../api";
 
 // `res.ok` is TRUE for a 202, so a plain `if (!res.ok) throw` guard silently
 // passes a "season cache is rebuilding" status body to the caller as if it were
@@ -67,5 +67,44 @@ describe("fetchPitcherSeasonTotals request shape", () => {
     expect(url).toContain("pitcher_id=660271");
     expect(url).toContain("start_date=2026-03-25");
     expect(url).toContain("end_date=2026-08-06");
+  });
+});
+
+describe("the All-Levels pseudo-level", () => {
+  afterEach(() => { delete global.fetch; jest.useRealTimers(); });
+
+  test("isAllLevels matches what the dropdown and localStorage can hold", () => {
+    expect(isAllLevels(ALL_LEVELS)).toBe(true);
+    expect(isAllLevels("all")).toBe(true);
+    ["AAA", "AA", "A+", "A", "R", "AFL", "", null, undefined].forEach(v => {
+      expect(isAllLevels(v)).toBe(false);
+    });
+  });
+
+  test("the level rides along on the pitcher-results request", async () => {
+    global.fetch = jest.fn(async () => mockResponse(200, []));
+
+    await fetchPitcherResults("2026-08-12", null, ALL_LEVELS);
+
+    expect(global.fetch.mock.calls[0][0]).toContain("level=ALL");
+  });
+
+  test("an All-Levels slate gets longer than the 45s default to build", async () => {
+    // Six levels' worth of live feeds in one request. Aborting a build that
+    // was going to succeed wastes the work AND leaves nothing warmed for the
+    // next caller, so this timeout is load-bearing, not cosmetic.
+    const timeouts = [];
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms) => { timeouts.push(ms); return realSetTimeout(fn, ms); };
+    global.fetch = jest.fn(async () => mockResponse(200, []));
+    try {
+      await fetchPitcherResults("2026-08-12", null, "AAA");
+      const singleLevel = Math.max(...timeouts);
+      timeouts.length = 0;
+      await fetchPitcherResults("2026-08-12", null, ALL_LEVELS);
+      expect(Math.max(...timeouts)).toBeGreaterThan(singleLevel);
+    } finally {
+      global.setTimeout = realSetTimeout;
+    }
   });
 });

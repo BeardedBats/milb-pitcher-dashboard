@@ -11,7 +11,7 @@ import SearchBar from "./components/SearchBar";
 import AdaptedResultsTable, { ADAPTED_COLUMNS, ADAPTED_DEFAULT_HIDDEN } from "./components/AdaptedResultsTable";
 import RehabStartsTable, { REHAB_COLUMNS, REHAB_DEFAULT_HIDDEN } from "./components/RehabStartsTable";
 import ExportGameLogsModal from "./components/ExportGameLogsModal";
-import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, fetchRehabStarts, DEFAULT_LEVEL } from "./utils/api";
+import { fetchGames, fetchPitchData, fetchPitcherResults, fetchPitcherCard, fetchDefaultDate, fetchGameLinescore, fetchGameView, reclassifyPitch, fetchInitialLoad, fetchRefresh, fetchLastRefresh, resolvePitcher, fetchLevels, fetchRehabStarts, DEFAULT_LEVEL, ALL_LEVELS, ALL_LEVELS_LABEL, isAllLevels } from "./utils/api";
 import { PITCH_TYPE_FILTERS, PITCH_COLORS, TEAM_FULL_NAMES, PITCHER_RESULTS_COLUMNS } from "./constants";
 import usePersistentState from "./hooks/usePersistentState";
 import { usePolledLinescore } from "./hooks/useLiveLinescore";
@@ -99,6 +99,14 @@ export default function App() {
   // pipeline answers (Statcast vs box-score); org is a pure client-side filter
   // on rows that already carry `org`.
   const [level, setLevel] = usePersistentState("pl_milb_level", DEFAULT_LEVEL);
+  // "All Levels": every level's pitchers for the selected date in ONE table.
+  // A leaderboard-only mode — the backend answers /api/games and
+  // /api/pitch-data with nothing for it, because a game tab and a pitch table
+  // each belong to exactly one level. isCardLevel("ALL") is already false (ALL
+  // is deliberately not in levelMeta.levels), so what renders is the adapted
+  // box-score table, at every level including AAA. Declared up here because the
+  // data effects below read it in their dependency arrays.
+  const allLevels = isAllLevels(level);
   const [orgFilter, setOrgFilter] = usePersistentState("pl_milb_org", "");
   const [levelMeta, setLevelMeta] = useState(null);
   // Rehab is a cross-level PAGE (MLB arms on the IL rehabbing anywhere in the
@@ -269,6 +277,8 @@ export default function App() {
   // reloading the heavier pitch-data tables every minute.
   useEffect(() => {
     if (!date || page !== "games" || date !== getBaseballDateEST()) return;
+    // Nothing to poll in All-Levels mode — there is no games list to refresh.
+    if (allLevels) return;
     let cancelled = false;
     let timer = null;
 
@@ -295,7 +305,7 @@ export default function App() {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [date, page]);
+  }, [date, page, allLevels]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -524,6 +534,15 @@ export default function App() {
     setGames([]); setSelectedGame(null); setCardData(null);
     setPitchData([]); setResultsData([]);
     setLoading(true); setError(null);
+    // All-Levels has no slate, so it also has no games 0->N transition — the
+    // effect below that normally loads the tables would never fire. This mode
+    // fetches its own rows instead; it is the only thing on the page.
+    if (allLevels) {
+      fetchPitcherResults(date, null, ALL_LEVELS)
+        .then(rows => { setResultsData(rows); setLoading(false); })
+        .catch(e => { setError(e.message); setLoading(false); });
+      return;
+    }
     fetchGames(date, level)
       .then(g => {
         setGames(g);
@@ -995,18 +1014,25 @@ export default function App() {
       {/* === GAMES PAGE (original daily view) === */}
       {page === "games" && !cardData && !loading && (
         <>
-          <GameTabs games={games} selectedGame={selectedGame} onSelectGame={gp => {
-            if (gp !== selectedGame && !isPopState.current) {
-              pushState({ view: "game", selectedGame: gp }, "");
-            }
-            setSelectedGame(gp); setCardData(null);
-          }} />
+          {/* No slate in All-Levels mode, and the tab strip's own All
+              Games / View Games switcher would be a control over nothing. */}
+          {!allLevels && (
+            <GameTabs games={games} selectedGame={selectedGame} onSelectGame={gp => {
+              if (gp !== selectedGame && !isPopState.current) {
+                pushState({ view: "game", selectedGame: gp }, "");
+              }
+              setSelectedGame(gp); setCardData(null);
+            }} />
+          )}
 
           {games.length > 0 && selectedGame && linescoreData && (
             <Scoreboard data={linescoreData} onInningClick={(inn, isTop) => setPbpModal({ inning: inn, isTop })} />
           )}
 
-          {games.length > 0 && (
+          {/* All-Levels has no games list by design, and the Level dropdown
+              lives in this row — gating it on games alone would strand the user
+              in a mode they could not switch out of. */}
+          {(games.length > 0 || allLevels) && (
             <>
               <div className="controls-row">
                 <button className={`view-btn${view === "pitcher-results" ? " active" : ""}`} onClick={() => setView("pitcher-results")}>
@@ -1037,6 +1063,11 @@ export default function App() {
                       ]).map(l => (
                         <option key={l.code} value={l.code}>{l.code}</option>
                       ))}
+                      {/* Last, not first: the single-level views are the
+                          everyday ones, and AAA stays the default. */}
+                      <option value={levelMeta?.all_levels?.code || ALL_LEVELS}>
+                        {levelMeta?.all_levels?.label || ALL_LEVELS_LABEL}
+                      </option>
                     </select>
                   </label>
                   <label className="level-select-label">
@@ -1158,9 +1189,12 @@ export default function App() {
               {view === "pitcher-results" && isStatcastLevel && (
                 <PitcherResultsTable data={filteredResultsData} date={date} onPitcherClick={openCard} spOnly={spOnly} splitByTeam={splitByTeam} isMobile={isMobile} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} hiddenCols={resultsHiddenCols} onSortedRowsChange={setCurrentTableRows} />
               )}
-              {/* Below AAA the box score is all there is — adapted columns only. */}
+              {/* Below AAA the box score is all there is — adapted columns
+                  only. All-Levels renders here too: its rows come off the same
+                  box-score path at every level, so they share this column set
+                  and each carries its own level tag in the Date cell. */}
               {!isStatcastLevel && (
-                <AdaptedResultsTable data={filteredResultsData} level={level} hiddenCols={adaptedHiddenCols} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
+                <AdaptedResultsTable data={filteredResultsData} level={allLevels ? "any level" : level} hiddenCols={adaptedHiddenCols} onPitcherClick={(id, e) => navigateToPlayer(id, null, e)} spOnly={spOnly} rpOnly={rpOnly} sortKey={resultsSortKey} onSortKeyChange={setResultsSortKey} sortDir={resultsSortDir} onSortDirChange={setResultsSortDir} onSortedRowsChange={setCurrentTableRows} />
               )}
             </div>
           </div>

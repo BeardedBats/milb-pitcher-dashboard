@@ -69,7 +69,20 @@ def aggregate_game_log_to_totals(game_log):
     total_runs = sum(g.get("runs", 0) for g in game_log)
     total_batters_faced = sum(g.get("batters_faced", 0) for g in game_log)
     total_games_started = sum(g.get("games_started", 0) for g in game_log)
-    total_pa_count = sum(g.get("pa_count", 0) for g in game_log)
+    # 2Str% is a PA rate, so its numerator and denominator must come from the
+    # SAME games. A game whose row carries two_strike_pas but no pa_count would
+    # otherwise push the season rate above 100% — which is exactly what a
+    # AA-then-AAA log did while the box-score path published a numerator only.
+    # PAR% keeps the full two_strike_pas sum: its numerator (ks) comes off the
+    # box score and is present on every row, so pairing there would shrink the
+    # denominator against a whole-season numerator instead.
+    two_str_rate_pairs = [
+        (g.get("pa_count", 0) or 0, g.get("two_strike_pas", 0) or 0)
+        for g in game_log
+        if (g.get("pa_count", 0) or 0) > 0
+    ]
+    total_pa_count = sum(pa for pa, _ in two_str_rate_pairs)
+    total_two_str_pas_rated = sum(tsp for _, tsp in two_str_rate_pairs)
     total_two_str_pas = sum(g.get("two_strike_pas", 0) for g in game_log)
     total_two_str_pitches = sum(g.get("two_strike_pitches", 0) for g in game_log)
     total_strikeouts_par = sum(g.get("strikeouts_for_par", 0) for g in game_log)
@@ -102,7 +115,7 @@ def aggregate_game_log_to_totals(game_log):
         "swstr_pct": round(total_whiffs / total_pitches * 100, 2) if total_pitches > 0 else 0,
         "csw_pct": round(sum(g.get("csw_pct", 0) * g.get("pitches", 0) for g in game_log) / total_pitches, 2) if total_pitches > 0 else 0,
         "strike_pct": round(total_strikes / total_pitches * 100, 2) if total_pitches > 0 else 0,
-        "two_str_pct": round(total_two_str_pas / total_pa_count * 100, 2) if total_pa_count > 0 else 0,
+        "two_str_pct": round(total_two_str_pas_rated / total_pa_count * 100, 2) if total_pa_count > 0 else 0,
         # PAR%: strikeouts / batters faced who reached a two-strike count.
         "par_pct": round(sum(g.get("ks", 0) for g in game_log) / total_two_str_pas * 100, 2) if total_two_str_pas > 0 else 0,
         "pitches": total_pitches,

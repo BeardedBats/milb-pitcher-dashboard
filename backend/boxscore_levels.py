@@ -115,11 +115,15 @@ _rows_cache = {}  # { (game_pk, level, is_final): (timestamp, rows) }
 #   3: five metric families + per-hand splits
 #   4: avg_velo (feed startSpeed; None wherever the level isn't pitch-tracked)
 #   5: fb_velo / fb_pitch / fb_count — primary-fastball velocity
+#   6: pa_count on every metrics dict, and two_str_pct switched from a PITCH
+#      rate to the PA rate the Statcast path already published. Without the
+#      denominator a row's two_strike_pas had nothing to divide by once a
+#      mixed-level season was totalled, and 2Str% printed 115%.
 #
 # Note the near-miss: replacing the literal with a constant set to 2 produced a
 # byte-identical key and kept serving the very rows the bump was meant to
 # retire. A version bump is only real if the resulting key string changes.
-_METRICS_VERSION = 5
+_METRICS_VERSION = 6
 
 
 # Pitches that count toward the "primary fastball". Two families only —
@@ -281,6 +285,13 @@ def _new_bucket():
         "z_swings": 0, "z_contact": 0, "o_contact": 0,
         "first_pitches": 0, "first_pitch_strikes": 0,
         "two_strike_pitches": 0,
+        # Plate-appearance granularity, credited to whoever FINISHED the PA.
+        # 2Str% and PAR% are both PA rates (matching the Statcast path in
+        # aggregation.py), so pa_count must be counted with exactly the same
+        # attribution rule as two_strike_pas — otherwise a season total can
+        # sum a numerator this module produced against a denominator it does
+        # not, and print an impossible rate.
+        "pas": 0, "two_strike_pas": 0, "pa_strikeouts": 0,
         "bip": 0, "gb": 0, "fb": 0, "ld": 0, "pu": 0,
         "soft": 0, "medium": 0, "hard": 0, "hardness_known": 0,
         "pull": 0, "center": 0, "oppo": 0, "spray_known": 0,
@@ -371,7 +382,18 @@ def _finalize(m):
         "first_pitch_strikes": m["first_pitch_strikes"],
         "f_strike_pct": _pct(m["first_pitch_strikes"], m["first_pitches"]),
         "two_strike_pitches": m["two_strike_pitches"],
-        "two_str_pct": _pct(m["two_strike_pitches"], p),
+        # PA-based, NOT pitch-based. The Statcast path publishes 2Str% as
+        # "PAs that reached two strikes / PAs" and the season-totals math sums
+        # two_strike_pas over pa_count, so a pitch-based rate here would be a
+        # different metric sharing a column — and, once totalled, a numerator
+        # with no matching denominator (the 115% seen on a AA->AAA log).
+        "pa_count": m["pas"],
+        "two_strike_pas": m["two_strike_pas"],
+        "two_str_pct": _pct(m["two_strike_pas"], m["pas"]),
+        "par_pct": _pct(m["pa_strikeouts"], m["two_strike_pas"]),
+        # The pitch-count version is still published under its own key so the
+        # two are never confused again.
+        "two_str_pitch_pct": _pct(m["two_strike_pitches"], p),
         # Zone (calibrated from Gameday pixels — see _plate_coords)
         "zone_pct": _pct(m["in_zone"], zk),
         "o_swing_pct": _pct(m["o_swings"], m["o_pitches"]),
@@ -435,8 +457,6 @@ def _derive_pitch_metrics(feed):
     plays = (((feed or {}).get("liveData") or {}).get("plays") or {}).get("allPlays") or []
     overall = {}
     splits = {}   # {pitcher_id: {"L": bucket, "R": bucket}}
-    # PAR% needs plate-appearance granularity, not pitch granularity.
-    pa_stats = {}  # {pitcher_id: {"two_strike_pas": n, "strikeouts": n}}
 
     def buckets_for(pid, bat_side):
         """Every counter update touches the overall bucket and, when the batter
@@ -459,6 +479,7 @@ def _derive_pitch_metrics(feed):
         current = play_pitcher if not has_sub else (active if active is not None else play_pitcher)
 
         reached_two_strikes = False
+        saw_pitch = False
         pa_ending_pitcher = current
         # GUMBO's `count` on a pitch event is the count AFTER that pitch, not
         # before it — verified against full PA sequences (a called strike on 0-0
@@ -545,6 +566,7 @@ def _derive_pitch_metrics(feed):
                     reached_two_strikes = True
                 prev_count = (after.get("balls") or 0, after.get("strikes") or 0)
                 pa_ending_pitcher = current
+                saw_pitch = True
 
             hd = e.get("hitData")
             if hd:
@@ -568,15 +590,20 @@ def _derive_pitch_metrics(feed):
                         m["spray_known"] += 1
                         m[spray] += 1
 
-        # PAR%: strikeouts as a share of the plate appearances that reached two
-        # strikes. Credited to whoever finished the PA, matching how the box
-        # score assigns the strikeout.
-        if pa_ending_pitcher is not None and reached_two_strikes:
-            st = pa_stats.setdefault(pa_ending_pitcher, {"two_strike_pas": 0, "strikeouts": 0})
-            st["two_strike_pas"] += 1
-            event_type = ((play.get("result") or {}).get("eventType") or "")
-            if event_type.startswith("strikeout"):
-                st["strikeouts"] += 1
+        # 2Str% and PAR% are plate-appearance rates, not pitch rates. Both are
+        # credited to whoever FINISHED the PA, matching how the box score
+        # assigns the strikeout — and, because pa_count uses the identical
+        # rule, two_strike_pas can never exceed the denominator it is divided
+        # by. A play with no pitch (a pickoff, a runner-only event) is not a
+        # plate appearance and must not inflate pa_count.
+        if pa_ending_pitcher is not None and saw_pitch:
+            for m in buckets_for(pa_ending_pitcher, bat_side):
+                m["pas"] += 1
+                if reached_two_strikes:
+                    m["two_strike_pas"] += 1
+                    event_type = ((play.get("result") or {}).get("eventType") or "")
+                    if event_type.startswith("strikeout"):
+                        m["pa_strikeouts"] += 1
 
         if current is not None:
             active = current
@@ -584,9 +611,6 @@ def _derive_pitch_metrics(feed):
     out = {}
     for pid, m in overall.items():
         rec = _finalize(m)
-        st = pa_stats.get(pid) or {}
-        rec["two_strike_pas"] = st.get("two_strike_pas", 0)
-        rec["par_pct"] = _pct(st.get("strikeouts", 0), st.get("two_strike_pas", 0))
         side_recs = {}
         for side, sm in (splits.get(pid) or {}).items():
             side_recs[side] = _finalize(sm)

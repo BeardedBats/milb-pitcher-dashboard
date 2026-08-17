@@ -31,7 +31,16 @@ export function aggregateGameLogTotals(log, replacementGame = null) {
 
   const totalPitches = normalizedLog.reduce((sum, g) => sum + (g.pitches || 0), 0);
   const ipThirds = normalizedLog.reduce((sum, g) => sum + ipToThirds(g.ip), 0);
-  const totalPa = normalizedLog.reduce((sum, g) => sum + (g.pa_count || 0), 0);
+  // 2Str% is a PA rate, so the numerator and denominator must come from the
+  // SAME games. Rows without a pa_count (the non-Statcast levels published
+  // two_strike_pas alone before backend _METRICS_VERSION 6) sit out of the rate
+  // entirely rather than adding a numerator with nothing to divide by — that
+  // mismatch is what printed 115% on a AA-then-AAA season line.
+  // PAR% still uses every row's two_strike_pas: its numerator (ks) comes off
+  // the box score and is present on every row regardless of level.
+  const ratedGames = normalizedLog.filter((g) => (g.pa_count || 0) > 0);
+  const totalPa = ratedGames.reduce((sum, g) => sum + (g.pa_count || 0), 0);
+  const ratedTwoStrikePas = ratedGames.reduce((sum, g) => sum + (g.two_strike_pas || 0), 0);
   const twoStrikePas = normalizedLog.reduce((sum, g) => sum + (g.two_strike_pas || 0), 0);
   const whiffs = normalizedLog.reduce((sum, g) => sum + (g.whiffs || 0), 0);
   const strikes = normalizedLog.reduce((sum, g) => sum + (g.strikes || 0), 0);
@@ -55,7 +64,7 @@ export function aggregateGameLogTotals(log, replacementGame = null) {
       ? normalizedLog.reduce((sum, g) => sum + ((g.csw_pct || 0) * (g.pitches || 0)), 0) / totalPitches
       : 0,
     strike_pct: totalPitches > 0 ? (strikes / totalPitches) * 100 : 0,
-    two_str_pct: totalPa > 0 ? (twoStrikePas / totalPa) * 100 : 0,
+    two_str_pct: totalPa > 0 ? (ratedTwoStrikePas / totalPa) * 100 : 0,
     par_pct: twoStrikePas > 0 ? (ks / twoStrikePas) * 100 : 0,
     pitches: totalPitches,
     pa_count: totalPa,

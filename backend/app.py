@@ -50,7 +50,8 @@ from aggregation import (
     new_pitch_data_accumulator, accumulate_pitch_data, finalize_pitch_data,
 )
 from levels import (
-    DEFAULT_LEVEL, LEVELS, LEVEL_ORDER, STATCAST_LEVELS, normalize_level,
+    ALL_LEVELS, ALL_LEVELS_LABEL, DEFAULT_LEVEL, LEVELS, LEVEL_ORDER,
+    STATCAST_LEVELS, normalize_level, is_all_levels,
     is_statcast_level, all_orgs, affiliates_for_org, team_display_name,
     level_sort_key as _level_sort_key,
 )
@@ -193,6 +194,68 @@ def _resolve_stat_lines_updated_at(date_str: str):
     return None
 
 
+def _box_results_key(date_str: str, level: str) -> str:
+    return f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date_str}"
+
+
+def _box_results_for_level(date_str: str, level: str, games=None):
+    """One level's adapted (box-score) rows for one date, through the daily cache.
+
+    Same key the single-level path has always written, so the "All Levels"
+    leaderboard and a plain AA homepage share warm data instead of each baking
+    their own copy. Rows come back untagged — callers run tag_mlb_experience
+    once over the merged list.
+    """
+    key = _box_results_key(date_str, level)
+    cached = get_agg_cache(key)
+    if cached is not None:
+        return cached
+    rows = get_level_results(date_str, level, games=games)
+    if rows:
+        set_agg_cache(key, rows)
+    return rows
+
+
+def _all_levels_results(date_str: str):
+    """Adapted rows for EVERY level on one date — the "All Levels" leaderboard.
+
+    This takes the box-score/feed path at all six levels, AAA and AFL included,
+    rather than Savant rows for those two and feed rows for the rest. One table
+    means one thing per column: SwStr% here is always whiffs off the live feed's
+    call codes over the feed's tracked pitches, so a AAA line and an A+ line
+    genuinely sort against each other. Mixing producers in one table would put
+    two different definitions of the same column under one header — the same
+    trap the season-rate rules in CLAUDE.md exist to prevent. (AAA's Statcast
+    columns aren't lost; they are what the AAA-only view is for.)
+
+    Sequential on purpose. get_level_results already fans a slate out 8 ways
+    and _fetch_feed pins each game's RAW feed payload in an L1 dict, so running
+    six slates at once would multiply both the in-flight requests and the peak
+    memory. Instead each level is built, cached, and its raw payloads dropped
+    before the next one starts — peak stays at one slate, the same as today.
+
+    Cold cost is one live feed per game across the whole slate, but every level
+    is persisted the moment it finishes, so even a request that dies against
+    maxDuration leaves the work it did behind for the retry.
+    """
+    rows = []
+    for code in LEVEL_ORDER:
+        try:
+            rows.extend(_box_results_for_level(date_str, code) or [])
+        except Exception as e:
+            # One dead level must not blank the other five. The gap is visible
+            # in the table (that level's rows are simply absent) rather than
+            # silently mixed into a wrong total, since nothing here sums levels.
+            print(f"[AllLevels] {date_str} {code} failed: {e}")
+        _evict_box_transients()
+    rows.sort(key=lambda r: (
+        _level_sort_key(r.get("level")),
+        r.get("team") or "",
+        r.get("appearance_order", 99),
+    ))
+    return rows
+
+
 def _build_selected_game_payload(date_str: str, game_pk: int):
     df = fetch_game_pitches(date_str, game_pk)
     pitch_data = aggregate_pitch_data(date_str, game_pk, df=df)
@@ -224,6 +287,12 @@ def levels_meta(response: Response):
             for code in LEVEL_ORDER
         ],
         "default_level": DEFAULT_LEVEL,
+        # Kept OUT of `levels`: that list is the real registry, and every reader
+        # of it (level tags, card availability, per-level fetches) would have to
+        # learn to skip a member with no sportId. The leaderboard's level
+        # dropdown is the one place that offers this, so it is the one place
+        # that reads it.
+        "all_levels": {"code": ALL_LEVELS, "label": ALL_LEVELS_LABEL},
         "orgs": all_orgs(),
     }
 
@@ -231,6 +300,12 @@ def levels_meta(response: Response):
 @app.get("/api/games")
 def games(response: Response, date: str = Query(...), level: str = Query(DEFAULT_LEVEL)):
     _set_response_cache(response, _cache_scope_for_date(date))
+    # "All Levels" is a date-scoped leaderboard, not a slate: a game tab drives
+    # /api/game-view, which is answered per level, so there is no honest way to
+    # offer 90 games from six schedules under one tab strip. No games, no tabs —
+    # the level dropdown stays reachable regardless (see App.jsx).
+    if is_all_levels(level):
+        return []
     return get_games(date, normalize_level(level))
 
 @app.get("/api/pitch-data")
@@ -241,6 +316,10 @@ def pitch_data(
     level: str = Query(DEFAULT_LEVEL),
 ):
     _set_response_cache(response, _cache_scope_for_date(date))
+    # Before normalize_level: it would turn ALL into AAA and quietly answer an
+    # all-levels request with a Triple-A pitch table.
+    if is_all_levels(level):
+        return []
     level = normalize_level(level)
     # Pitch data exists only where Statcast does. Non-Statcast levels render
     # the adapted box-score table and never ask for this, but an explicit empty
@@ -267,19 +346,18 @@ def pitcher_results(
     level: str = Query(DEFAULT_LEVEL),
 ):
     _set_response_cache(response, _cache_scope_for_date(date))
+    # Checked before normalize_level, which would silently answer ALL with AAA.
+    if is_all_levels(level):
+        rows = tag_mlb_experience(_all_levels_results(date))
+        if game_pk is not None:
+            rows = [r for r in rows if r.get("game_pk") == int(game_pk)]
+        return rows
     level = normalize_level(level)
     # Below AAA there is no pitch tracking at all, so these rows come straight
     # off the box score and carry the adapted column set (Str%, GO/AO) instead
     # of Statcast-derived metrics.
     if not is_statcast_level(level):
-        agg_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
-        cached = get_agg_cache(agg_key)
-        if cached is not None:
-            rows = tag_mlb_experience(cached)
-        else:
-            rows = tag_mlb_experience(get_level_results(date, level))
-            if rows:
-                set_agg_cache(agg_key, rows)
+        rows = tag_mlb_experience(_box_results_for_level(date, level))
         if game_pk is not None:
             rows = [r for r in rows if r.get("game_pk") == int(game_pk)]
         return rows
@@ -318,7 +396,11 @@ def game_view(
     level: str = Query(DEFAULT_LEVEL),
 ):
     _set_response_cache(response, _cache_scope_for_date(date))
-    level = normalize_level(level)
+    # There are no game tabs in All-Levels mode, so nothing should reach this
+    # with ALL. If something does, the payload itself is level-independent
+    # (game_pk is unique across levels and _build_selected_game_payload never
+    # reads the level) — only the cache key is namespaced by it.
+    level = DEFAULT_LEVEL if is_all_levels(level) else normalize_level(level)
     agg_key = (
         f"game_view_{level}_{date}_{int(game_pk)}"
         f"_v{get_override_version()}_s{CARD_SCHEMA_VERSION}"
@@ -336,7 +418,8 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
     Eliminates the frontend waterfall of sequential API calls on first load.
     Defaults to AAA — the only level with a full Statcast homepage."""
     _set_response_cache(response, "live")
-    level = normalize_level(level)
+    all_levels = is_all_levels(level)   # before normalize_level turns it into AAA
+    level = ALL_LEVELS if all_levels else normalize_level(level)
     started = time.perf_counter()
     timings = {}
 
@@ -344,18 +427,30 @@ def initial_load(response: Response, level: str = Query(DEFAULT_LEVEL)):
     date = get_default_date()
     timings["default_date"] = round((time.perf_counter() - section) * 1000, 1)
 
+    if all_levels:
+        # No slate and no pitch table in All-Levels mode — see /api/games.
+        section = time.perf_counter()
+        rows = tag_mlb_experience(_all_levels_results(date))
+        timings["all_levels_results"] = round((time.perf_counter() - section) * 1000, 1)
+        print(f"[InitialLoad] date={date} level=ALL timings_ms={timings}")
+        return {
+            "date": date,
+            "level": ALL_LEVELS,
+            "games": [],
+            "pitchData": [],
+            "resultsData": rows,
+            "statLinesUpdatedAt": _resolve_stat_lines_updated_at(date),
+        }
+
     section = time.perf_counter()
     games_list = get_games(date, level)
     timings["games"] = round((time.perf_counter() - section) * 1000, 1)
 
     if not is_statcast_level(level):
         # Box-score-only level: no pitch data, adapted results table.
-        box_key = f"daily_results_box_{level}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{date}"
-        rows = get_agg_cache(box_key)
-        if rows is None:
-            rows = tag_mlb_experience(get_level_results(date, level, games=games_list))
-            if rows:
-                set_agg_cache(box_key, rows)
+        # Tagged on the cached branch too — the cache predates the flag and a
+        # warm slate used to serve rows with no mlb_exp at all.
+        rows = tag_mlb_experience(_box_results_for_level(date, level, games=games_list))
         return {
             "date": date,
             "level": level,
@@ -2333,13 +2428,28 @@ def cron_warmup_daily(request: Request, response: Response):
                     # get_level_results pulls each game's live feed once and
                     # derives the pitch metrics, so this also warms the
                     # per-game metric cache that player-page logs read.
-                    rows = get_level_results(default_date, code)
-                    if rows:
-                        set_agg_cache(f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}m{_METRICS_VERSION}_{default_date}", rows)
+                    _box_results_for_level(default_date, code)
                 warmed.append(code)
             except Exception as e:
                 print(f"[WarmupDaily] {code} failed: {e}")
                 skipped.append(code)
+
+        # The "All Levels" leaderboard reads the box-score path at EVERY level,
+        # so AAA and AFL need their adapted rows too — the loop above built only
+        # their Statcast ones. Runs after it, sharing the same deadline, because
+        # a single-level homepage is the more important thing to have warm; a
+        # slow morning should cut this rather than that.
+        box_warmed = []
+        for code in STATCAST_LEVELS:
+            if time.time() >= deadline:
+                break
+            try:
+                _box_results_for_level(default_date, code)
+                box_warmed.append(code)
+            except Exception as e:
+                print(f"[WarmupDaily] all-levels box rows for {code} failed: {e}")
+            # Raw feed payloads for a whole slate, dropped before the next one.
+            _evict_box_transients()
         record_stat_lines_refresh(default_date)
         print(f"[WarmupDaily] {default_date}: warmed {warmed}, skipped {skipped}")
         try:
@@ -2379,34 +2489,41 @@ def cron_warmup_daily(request: Request, response: Response):
                     recent_skipped += 1
                     continue
                 try:
+                    warmed_any = False
                     if is_statcast_level(code):
                         pitch_key = f"daily_pitch_{code}_{day}"
                         results_key = f"daily_results_{code}_s{CARD_SCHEMA_VERSION}_{day}"
-                        if (get_agg_cache(pitch_key) is not None
-                                and get_agg_cache(results_key) is not None):
-                            continue
+                        if (get_agg_cache(pitch_key) is None
+                                or get_agg_cache(results_key) is None):
+                            get_games(day, code)
+                            set_agg_cache(pitch_key, aggregate_pitch_data(day, None, level=code))
+                            set_agg_cache(results_key,
+                                          aggregate_pitcher_results(day, None, level=code))
+                            warmed_any = True
+                    # Every level, AAA and AFL included: the All-Levels
+                    # leaderboard reads the box-score path everywhere, so paging
+                    # a day back there needs these rows at the Statcast levels
+                    # too. get_games is cached, so the repeat call is free.
+                    if get_agg_cache(_box_results_key(day, code)) is None:
                         get_games(day, code)
-                        set_agg_cache(pitch_key, aggregate_pitch_data(day, None, level=code))
-                        set_agg_cache(results_key,
-                                      aggregate_pitcher_results(day, None, level=code))
-                    else:
-                        box_key = (f"daily_results_box_{code}_s{CARD_SCHEMA_VERSION}"
-                                   f"m{_METRICS_VERSION}_{day}")
-                        if get_agg_cache(box_key) is not None:
-                            continue
-                        get_games(day, code)
-                        rows = get_level_results(day, code)
-                        if rows:
-                            set_agg_cache(box_key, rows)
-                    recent_warmed += 1
+                        _box_results_for_level(day, code)
+                        warmed_any = True
+                    if warmed_any:
+                        recent_warmed += 1
                 except Exception as e:
                     print(f"[WarmupDaily] recent slate {day}/{code} failed: {e}")
                     recent_skipped += 1
+            # Same eviction rule the season backfill follows: this loop walks a
+            # week of slates in ONE long-lived instance and _fetch_feed pins
+            # every game's raw payload in L1, so drop them between days. Redis
+            # keeps the derived rows, which is the product of the warm.
+            _evict_box_transients()
 
         now = _now_et().isoformat()
         redis_set("last_refresh", now)
         return {"status": "ok", "timestamp": now, "date": default_date,
                 "levels_warmed": warmed, "levels_skipped": skipped,
+                "all_levels_box_warmed": box_warmed,
                 "recent_slates_warmed": recent_warmed,
                 "recent_slates_skipped": recent_skipped}
     except Exception as e:

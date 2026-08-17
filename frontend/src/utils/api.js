@@ -35,10 +35,10 @@ async function fetchWithTimeout(url, { timeoutMs = 45000, ...options } = {}) {
   }
 }
 
-async function fetchJson(url, { errorMessage, retries = 0, retryDelayMs = 250, shouldRetry } = {}) {
+async function fetchJson(url, { errorMessage, retries = 0, retryDelayMs = 250, shouldRetry, timeoutMs } = {}) {
   let attempt = 0;
   while (true) {
-    const res = await fetchWithTimeout(url);
+    const res = await fetchWithTimeout(url, timeoutMs ? { timeoutMs } : undefined);
     if (res.ok) return res.json();
     if (attempt >= retries || !shouldRetry || !shouldRetry(res)) {
       throw new Error(errorMessage || "Request failed");
@@ -51,6 +51,21 @@ async function fetchJson(url, { errorMessage, retries = 0, retryDelayMs = 250, s
 // Every date-scoped request carries the level — AAA and AA both play on the
 // same date, so omitting it would silently mix levels.
 export const DEFAULT_LEVEL = "AAA";
+
+// The leaderboard's "All Levels" filter. A pseudo-level, not a member of the
+// registry: the backend answers it by folding all six levels' box-score rows
+// into one table, and returns nothing for the game- and pitch-scoped endpoints
+// (see /api/games in backend/app.py).
+export const ALL_LEVELS = "ALL";
+export const ALL_LEVELS_LABEL = "All Levels";
+export const isAllLevels = (level) => String(level || "").toUpperCase() === ALL_LEVELS;
+
+// A cold All-Levels slate builds six levels' worth of rows in one request —
+// one live feed per game across every level, ~90 games on a full summer night.
+// Each level is cached the moment it finishes, so the cost is paid once per
+// date, but the FIRST caller has to be allowed to wait for it. The default 45s
+// would abort a build that was going to succeed and leave nothing warmed.
+const ALL_LEVELS_TIMEOUT_MS = 120000;
 
 export async function fetchLevels() {
   return fetchJson(`${BASE}/api/levels`, {
@@ -91,6 +106,7 @@ export async function fetchPitcherResults(date, gamePk, level = DEFAULT_LEVEL) {
     errorMessage: "Failed to fetch pitcher results",
     retries: gamePk == null ? 1 : 0,
     shouldRetry: (res) => res.status >= 500 || res.status === 429,
+    ...(isAllLevels(level) ? { timeoutMs: ALL_LEVELS_TIMEOUT_MS } : {}),
   });
 }
 
@@ -166,7 +182,7 @@ export async function fetchInitialLoad(level = DEFAULT_LEVEL) {
   // connections.
   const res = await fetchWithTimeout(
     `${BASE}/api/initial-load?level=${encodeURIComponent(level)}`,
-    { timeoutMs: 60000 },
+    { timeoutMs: isAllLevels(level) ? ALL_LEVELS_TIMEOUT_MS : 60000 },
   );
   if (!res.ok) throw new Error("Failed to fetch initial load");
   return res.json();

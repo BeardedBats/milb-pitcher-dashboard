@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Added — "All Levels" filter on the daily pitcher leaderboard
+The Level dropdown on the games page now offers **All Levels** alongside the six
+real ones: every level's pitchers for the selected date, in one sortable table.
+Until now the only way to see who threw well across the system on a given night
+was to load six pages and compare them by eye.
+
+- One row shape, one producer. All-Levels takes the box-score/play-by-play path
+  at **every** level, AAA and AFL included, rather than Savant rows for those two
+  and feed rows for the rest — so SwStr% under one header means one thing and a
+  AAA line and an A+ line genuinely sort against each other. AAA's Statcast
+  columns are unchanged and still live in the AAA view. Rows render in
+  `AdaptedResultsTable`, each tagged with its own level in the Date cell.
+- `ALL` is a pseudo-level (`levels.ALL_LEVELS`), deliberately not a member of
+  `LEVELS`: it has no sportId. Every level-taking endpoint asks `is_all_levels()`
+  **before** `normalize_level()`, which coerces anything unknown to AAA and
+  would otherwise answer an all-levels request with Triple-A, silently.
+- Leaderboard-only mode: `/api/games` and `/api/pitch-data` answer it with
+  nothing, since a game tab and a pitch table each belong to one level. The tab
+  strip hides, and the filter row now renders whenever All-Levels is selected —
+  gating it on "are there games" alone would strand the user in a mode with no
+  way back to a level.
+- The fan-out reads the same `daily_results_box_{level}_…` key the single-level
+  pages write, so a warm AA homepage makes the AA slice free and vice versa. It
+  folds levels sequentially and drops each slate's raw feed payloads before the
+  next, keeping peak memory at one slate. `warmup-daily` now also warms AAA/AFL
+  box rows for the default date and the past week, so the common case is warm;
+  the client allows a cold All-Levels build 120s instead of 45s.
+- Org / SP-only / RP-only / MLB Green / Columns and the CSV export all work
+  unchanged — the export follows the level like it always has and stamps each
+  row's own level.
+
 ### Changed — Rehab is its own page at `/rehab`
 The Rehab view was a toggle button inside the daily slate's filter row, which
 made it un-linkable: it answered a question about a two-week window across every

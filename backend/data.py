@@ -179,7 +179,10 @@ _override_version = 0  # Incremented on every save/remove to bust agg caches
 #      the v46 daily payloads were populated with the OLD metric shape and
 #      would never self-correct. _METRICS_VERSION now versions the per-game
 #      keys; this bump clears the daily ones they poisoned. Bump BOTH together.
-CARD_SCHEMA_VERSION = 47
+#   48: paired with _METRICS_VERSION 6 — non-Statcast rows now carry pa_count
+#      and a PA-based two_str_pct, so a mixed-level season total divides
+#      two_strike_pas by a denominator that covers every level it summed.
+CARD_SCHEMA_VERSION = 48
 
 STAT_LINES_REFRESH_PREFIX = "stat_lines_refresh"
 RANGE_DAY_PREFIX = "range_day"

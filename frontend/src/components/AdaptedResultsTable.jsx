@@ -41,7 +41,7 @@ export const ADAPTED_COLUMNS = [
   { key: "contact_pct", label: "Contact%", group: "Plate discipline", off: true, title: "Contact / swings" },
 
   { key: "f_strike_pct", label: "F-Str%", group: "Count", off: true, title: "First-pitch strikes / plate appearances" },
-  { key: "two_str_pct", label: "2Str%", group: "Count", off: true, title: "Pitches thrown in two-strike counts / pitches" },
+  { key: "two_str_pct", label: "2Str%", group: "Count", off: true, title: "Plate appearances that reached two strikes / plate appearances" },
   { key: "par_pct", label: "PAR%", group: "Count", off: true, title: "Strikeouts / plate appearances that reached two strikes" },
 
   { key: "zone_pct", label: "Zone%", group: "Zone", off: true, title: "In-zone pitches / pitches (location calibrated from Gameday coordinates)" },

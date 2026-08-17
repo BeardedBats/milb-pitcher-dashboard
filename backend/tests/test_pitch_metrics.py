@@ -145,6 +145,66 @@ def test_two_strike_pitches_count_pitches_thrown_in_two_strike_counts():
     ])])
     m = b._derive_pitch_metrics(feed)[1]
     assert m["two_strike_pitches"] == 2
+    # The pitch rate keeps its own key; 2Str% itself is a PA rate.
+    assert m["two_str_pitch_pct"] == 50.0
+    assert m["two_str_pct"] == 100.0   # the one PA reached two strikes
+
+
+def test_two_str_pct_is_a_pa_rate_with_its_own_denominator():
+    """2Str% must be PAs-that-reached-two-strikes / PAs, matching the Statcast
+    path — and pa_count must ship alongside it.
+
+    A pitch-based rate here published a numerator (two_strike_pas) that no
+    denominator on the row could divide, so a season line mixing these levels
+    with AAA summed two_strike_pas over AAA-only PAs and printed 115%.
+    """
+    reached = _play(1, [_pitch_c(0, "C", 0, 1, pitch_number=1),
+                        _pitch_c(1, "C", 0, 2, pitch_number=2),
+                        _pitch_c(2, "X", 0, 2, pitch_number=3,
+                                 hit={"trajectory": "ground_ball"})])
+    reached["result"] = {"eventType": "field_out"}
+    quick = _play(1, [_pitch_c(0, "X", 0, 0, pitch_number=1,
+                               hit={"trajectory": "fly_ball"})])
+    quick["result"] = {"eventType": "flyout"}
+    m = b._derive_pitch_metrics(_feed([reached, quick]))[1]
+    assert m["pa_count"] == 2
+    assert m["two_strike_pas"] == 1
+    assert m["two_str_pct"] == 50.0
+    # The invariant the season total depends on: the numerator can never
+    # outrun the denominator shipped with it.
+    assert m["two_strike_pas"] <= m["pa_count"]
+
+
+def test_pa_count_credits_the_pitcher_who_finished_the_pa():
+    """Same attribution rule as two_strike_pas — a mid-PA reliever change must
+    not leave one pitcher holding a numerator the other holds the denominator
+    for."""
+    play = _play(1, [
+        _pitch_c(0, "C", 0, 1, pitch_number=1),
+        _sub(1, 2),
+        _pitch_c(2, "C", 0, 2, pitch_number=2),
+        _pitch_c(3, "S", 0, 3, pitch_number=3),
+    ])
+    play["result"] = {"eventType": "strikeout"}
+    out = b._derive_pitch_metrics(_feed([play]))
+    assert out[1]["pa_count"] == 0        # threw a pitch, didn't finish the PA
+    assert out[2]["pa_count"] == 1
+    assert out[2]["two_strike_pas"] == 1
+    assert out[2]["par_pct"] == 100.0
+
+
+def test_pa_count_ignores_plays_with_no_pitch():
+    """A pickoff or runner-only play is not a plate appearance; counting one
+    would understate 2Str% instead of overstating it."""
+    runner_only = _play(1, [{"index": 0, "isPitch": False, "details": {}}])
+    runner_only["result"] = {"eventType": "stolen_base_2b"}
+    real_pa = _play(1, [_pitch_c(0, "C", 0, 1, pitch_number=1),
+                        _pitch_c(1, "C", 0, 2, pitch_number=2),
+                        _pitch_c(2, "S", 0, 3, pitch_number=3)])
+    real_pa["result"] = {"eventType": "strikeout"}
+    m = b._derive_pitch_metrics(_feed([runner_only, real_pa]))[1]
+    assert m["pa_count"] == 1
+    assert m["two_str_pct"] == 100.0
 
 
 def test_par_pct_is_strikeouts_over_pas_that_reached_two_strikes():

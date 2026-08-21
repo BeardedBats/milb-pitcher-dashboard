@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { PITCH_COLORS, CARD_PITCH_DATA_COLUMNS, displayTeamAbbrev } from "../constants";
 import useIsMobile from "../hooks/useIsMobile";
 import PitchDataTable from "./PitchDataTable";
@@ -8,7 +8,7 @@ import PitchFilterDropdown from "./PitchFilterDropdown";
 import ResultsTable from "./ResultsTable";
 import UsageTable from "./UsageTable";
 import { classifyPitchResult, isRunScored, isStrikeoutPitch, isBallInPlay, classifyBIPQuality, RESULT_FILTER_OPTIONS, RESULT_QUICK_ACTIONS } from "../utils/pitchFilters";
-import { fetchPlayerPageResource, fetchWarmupStatus } from "../utils/api";
+import { fetchPlayerPageResource, fetchWarmupStatus, fetchGameLinescore } from "../utils/api";
 import { downloadCsv, csvSlug } from "../utils/csv";
 import { buildCardHash } from "../utils/navigation";
 import useWarmupBackedResource from "../hooks/useWarmupBackedResource";
@@ -17,6 +17,7 @@ import LoadError from "./LoadError";
 import usePitchFilters from "../hooks/usePitchFilters";
 import VelocityChart from "./VelocityChart";
 import RegularSeasonTable from "./RegularSeasonTable";
+import { resolveSingleGamePk, velocityChartMode } from "../utils/velocityChart";
 
 export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
   const isMobile = useIsMobile();
@@ -175,12 +176,15 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
   const multiGame = sortedLog.length > 1;
   const pbpDisabled = multiGame && gameFilter === "all";
 
+  // The one game currently in view — the dropdown's pick, or the pitcher's
+  // only start. Null means several games are on screen at once.
+  const singleGamePk = useMemo(
+    () => resolveSingleGamePk(gameFilter, sortedLog),
+    [gameFilter, sortedLog]
+  );
+
   // Resolve the game_pk for PBP navigation
-  const pbpGamePk = useMemo(() => {
-    if (gameFilter !== "all") return gameFilter;
-    if (sortedLog.length === 1) return sortedLog[0].game_pk;
-    return null;
-  }, [gameFilter, sortedLog]);
+  const pbpGamePk = singleGamePk;
 
   const pbpGameDate = useMemo(() => {
     if (!pbpGamePk) return null;
@@ -192,6 +196,41 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
     if (pbpDisabled || !pbpGamePk || !pbpGameDate) return;
     onGameClick(pbpGameDate, pitcherId, pbpGamePk);
   };
+
+  // Velocity trend: the game chart (inning headers + velo per inning, legend
+  // click-to-lock) whenever one game is in view, the season chart otherwise.
+  // See utils/velocityChart.js for why the two can't be swapped freely.
+  const veloMode = velocityChartMode(singleGamePk);
+
+  // Linescore for that game — it is what fills the game chart's inning-header
+  // play-by-play tooltip. Fetched lazily (only while the velocity view is
+  // actually open) and best-effort: without it the headers simply have no
+  // tooltip, so a failure is not surfaced. Cached per game_pk so flipping
+  // between tabs doesn't refetch.
+  const linescoreCacheRef = useRef({});
+  const [linescore, setLinescore] = useState(null); // { pk, data }
+  useEffect(() => {
+    if (metricsView !== "velocity-trend" || !singleGamePk) return undefined;
+    const pk = String(singleGamePk);
+    const cached = linescoreCacheRef.current[pk];
+    if (cached) {
+      setLinescore({ pk, data: cached });
+      return undefined;
+    }
+    let cancelled = false;
+    setLinescore(null);
+    fetchGameLinescore(singleGamePk)
+      .then(ls => {
+        linescoreCacheRef.current[pk] = ls;
+        if (!cancelled) setLinescore({ pk, data: ls });
+      })
+      .catch(() => { /* headers stay tooltip-less */ });
+    return () => { cancelled = true; };
+  }, [metricsView, singleGamePk]);
+
+  // Guard against a stale payload painting the wrong game's play-by-play.
+  const veloLinescore =
+    singleGamePk && linescore && linescore.pk === String(singleGamePk) ? linescore.data : null;
 
   // Season game log → one CSV. Raw values (26.3, not "26%"), empty cells for
   // fields a box-score-level game doesn't carry.
@@ -402,7 +441,13 @@ export default function PlayerPage({ pitcherId, onBack, onGameClick }) {
               )}
               {metricsView === "velocity-trend" && (
                 <div className="metrics-card">
-                  <VelocityChart mode="season" pitches={filteredPitches} isMobile={isMobile} />
+                  <VelocityChart
+                    mode={veloMode}
+                    pitches={filteredPitches}
+                    isMobile={isMobile}
+                    linescoreData={veloLinescore}
+                    pitcherId={pitcherId}
+                  />
                 </div>
               )}
             </div>

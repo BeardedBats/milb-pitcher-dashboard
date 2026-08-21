@@ -5,6 +5,7 @@ import { classifyBattedBall } from "../utils/formatting";
 import { vpToZoomCoord, getDesktopZoom } from "../utils/desktopZoom";
 import { normalizePlateZ, DISPLAY_SZ_TOP, DISPLAY_SZ_BOT } from "../utils/strikezone";
 import { ordinalInning as ordinal, formatBaseState } from "../utils/gamePresentation";
+import { shortGameDate, axisTickStep } from "../utils/velocityChart";
 
 const DOT_R = 4.5;
 const DOT_PAD = 3;
@@ -13,7 +14,7 @@ const GLOW_R = 12;
 // PA result colors are sourced from getPBPResultColor (utils/pitchFilters) so
 // Scoreboard, this component, PitcherCard, and PlayByPlayModal stay in sync.
 
-export default function VelocityTrendV2({ pitches, onReclassify, isMobile, linescoreData, pitcherId }) {
+export default function VelocityTrendV2({ pitches, onReclassify, isMobile, linescoreData, pitcherId, groupBy = "inning" }) {
   const displayAbbrev = (abbr) => displayTeamAbbrev(abbr);
   const canvasRef = useRef(null);
   const wrapRef = useRef(null);
@@ -28,11 +29,25 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
   const [lockedType, setLockedType] = useState(null);
   const [mobileTooltipVis, setMobileTooltipVis] = useState(null);
 
-  const { ordered, inningBounds, typeStats, pitchTypes, globalMin, globalMax, inningStats } = useMemo(() => {
+  // The chart is sliced into vertical panels, each with a velo header above it.
+  // ONE game slices by inning; a multi-game frame (the player page's All Games)
+  // slices by game — panelling a season by inning would pool every start's 3rd
+  // inning into one header. Everything downstream is panel-generic, so the two
+  // modes are the same chart with a different definition of "panel".
+  const byGame = groupBy === "game";
+
+  const { ordered, panelBounds, typeStats, pitchTypes, globalMin, globalMax, panelStats } = useMemo(() => {
     if (!pitches || pitches.length === 0)
-      return { ordered: [], inningBounds: [], typeStats: {}, pitchTypes: [], globalMin: 0, globalMax: 0, inningStats: {} };
+      return { ordered: [], panelBounds: [], typeStats: {}, pitchTypes: [], globalMin: 0, globalMax: 0, panelStats: {} };
 
     const sorted = [...pitches].sort((a, b) => {
+      // at_bat_number restarts every game, so across games the date leads.
+      if (byGame) {
+        const da = a.game_date || "", db = b.game_date || "";
+        if (da !== db) return da < db ? -1 : 1;
+        const ga = String(a.game_pk ?? ""), gb = String(b.game_pk ?? "");
+        if (ga !== gb) return ga < gb ? -1 : 1;
+      }
       if (a.at_bat_number != null && b.at_bat_number != null) {
         if (a.at_bat_number !== b.at_bat_number) return a.at_bat_number - b.at_bat_number;
         return (a.pitch_number || 0) - (b.pitch_number || 0);
@@ -40,24 +55,30 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       return 0;
     });
 
+    const keyOf = (p) => {
+      const raw = byGame ? p.game_pk : p.inning;
+      return raw == null ? null : String(raw);
+    };
+    const labelOf = (p) => (byGame ? shortGameDate(p.game_date) : ordinal(p.inning));
+
     const bounds = [];
-    let lastInning = null;
+    let lastKey = null;
     const ord = sorted.map((p, i) => {
-      const inn = p.inning;
-      if (inn != null && inn !== lastInning) {
-        // pitchIdx = first pitch of this inning; prevPitchIdx = last pitch of previous inning
-        bounds.push({ pitchIdx: i + 1, prevPitchIdx: i, inning: inn });
-        lastInning = inn;
+      const key = keyOf(p);
+      if (key != null && key !== lastKey) {
+        // pitchIdx = first pitch of this panel; prevPitchIdx = last pitch of the previous one
+        bounds.push({ pitchIdx: i + 1, prevPitchIdx: i, key, label: labelOf(p), inning: p.inning });
+        lastKey = key;
       }
-      return { ...p, _seqNum: i + 1 };
+      return { ...p, _seqNum: i + 1, _panelKey: key };
     });
 
     const stats = {};
     let gMin = Infinity, gMax = -Infinity;
-    // Per-inning velo. The fb/cutter buckets drive the default header (fastball
+    // Per-panel velo. The fb/cutter buckets drive the default header (fastball
     // family); byType holds every pitch type so the header can switch to a
     // single focused type (legend lock or pitch-overview selection).
-    const innStats = {};
+    const panStats = {};
     const mkBucket = () => ({ sum: 0, count: 0, min: Infinity, max: -Infinity });
     const addToBucket = (b, v) => { b.sum += v; b.count++; b.min = Math.min(b.min, v); b.max = Math.max(b.max, v); };
     for (const p of ord) {
@@ -72,11 +93,11 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       gMin = Math.min(gMin, p.release_speed);
       gMax = Math.max(gMax, p.release_speed);
 
-      // Per-inning velo: fastball-family default buckets + a per-type map
-      const inn = p.inning;
-      if (inn != null) {
-        if (!innStats[inn]) innStats[inn] = { fb: mkBucket(), cutter: mkBucket(), byType: {} };
-        const is = innStats[inn];
+      // Per-panel velo: fastball-family default buckets + a per-type map
+      const key = p._panelKey;
+      if (key != null) {
+        if (!panStats[key]) panStats[key] = { fb: mkBucket(), cutter: mkBucket(), byType: {} };
+        const is = panStats[key];
         if (name === "Four-Seamer" || name === "Sinker") addToBucket(is.fb, p.release_speed);
         else if (name === "Cutter") addToBucket(is.cutter, p.release_speed);
         if (!is.byType[name]) is.byType[name] = mkBucket();
@@ -88,8 +109,8 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
     // Sort pitch types by avg velo descending
     const types = Object.keys(stats).sort((a, b) => stats[b].avg - stats[a].avg);
 
-    return { ordered: ord, inningBounds: bounds, typeStats: stats, pitchTypes: types, globalMin: gMin, globalMax: gMax, inningStats: innStats };
-  }, [pitches]);
+    return { ordered: ord, panelBounds: bounds, typeStats: stats, pitchTypes: types, globalMin: gMin, globalMax: gMax, panelStats: panStats };
+  }, [pitches, byGame]);
 
   // Measure container width
   useEffect(() => {
@@ -155,13 +176,13 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
     const veloRange = veloMax - veloMin || 1;
     const toY = (velo) => innerTop + ((veloMax - velo) / veloRange) * innerH;
 
-    // Build per-pitch inning index so dots can be clamped to their own inning
-    const pitchInningIdx = new Array(ordered.length).fill(0);
-    for (let i = 0; i < inningBounds.length; i++) {
-      const start = inningBounds[i].pitchIdx - 1;
-      const end = i + 1 < inningBounds.length ? inningBounds[i + 1].pitchIdx - 1 : ordered.length;
+    // Build per-pitch panel index so dots can be clamped to their own panel
+    const pitchPanelIdx = new Array(ordered.length).fill(0);
+    for (let i = 0; i < panelBounds.length; i++) {
+      const start = panelBounds[i].pitchIdx - 1;
+      const end = i + 1 < panelBounds.length ? panelBounds[i + 1].pitchIdx - 1 : ordered.length;
       for (let j = start; j < end; j++) {
-        pitchInningIdx[j] = i;
+        pitchPanelIdx[j] = i;
       }
     }
 
@@ -169,14 +190,14 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
     ctx.fillStyle = "rgba(255,255,255,0.02)";
     ctx.fillRect(PAD.left, innerTop, plotW, innerH);
 
-    // Alternating inning panels
+    // Alternating panel shading
     const containerTop = innerTop;
     const containerBot = innerTop + innerH;
-    // Precompute divider X positions (midpoint between last/first pitch of adjacent innings)
-    const dividerXs = inningBounds.map(bd =>
+    // Precompute divider X positions (midpoint between last/first pitch of adjacent panels)
+    const dividerXs = panelBounds.map(bd =>
       bd.prevPitchIdx > 0 ? (toX(bd.prevPitchIdx) + toX(bd.pitchIdx)) / 2 : PAD.left
     );
-    for (let i = 0; i < inningBounds.length; i++) {
+    for (let i = 0; i < panelBounds.length; i++) {
       const sx = dividerXs[i];
       const ex = i + 1 < dividerXs.length ? dividerXs[i + 1] : PAD.left + plotW;
       if (i % 2 === 1) {
@@ -191,11 +212,11 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       if (!p.pitch_name || p.release_speed == null) continue;
       const color = PITCH_COLORS[p.pitch_name] || "#888";
       const rawX = toX(p._seqNum);
-      // Determine this pitch's inning panel left/right edges
-      const iIdx = pitchInningIdx[p._seqNum - 1] || 0;
+      // Determine this pitch's panel left/right edges
+      const iIdx = pitchPanelIdx[p._seqNum - 1] || 0;
       const panelLeft = dividerXs[iIdx];
       const panelRight = iIdx + 1 < dividerXs.length ? dividerXs[iIdx + 1] : PAD.left + plotW;
-      // Clamp dot within its inning panel
+      // Clamp dot within its own panel
       const cx = Math.max(panelLeft + DOT_PAD + DOT_R, Math.min(panelRight - DOT_PAD - DOT_R, rawX));
       const rawY = toY(p.release_speed);
       const cy = Math.max(innerTop + DOT_R + DOT_PAD, Math.min(innerTop + innerH - DOT_R - DOT_PAD, rawY));
@@ -230,9 +251,9 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       dots.push({ x: cx, y: cy, pitch: p });
     }
 
-    // Inning dividers
-    for (let i = 0; i < inningBounds.length; i++) {
-      if (inningBounds[i].prevPitchIdx <= 0) continue;
+    // Panel dividers
+    for (let i = 0; i < panelBounds.length; i++) {
+      if (panelBounds[i].prevPitchIdx <= 0) continue;
       const x = dividerXs[i];
       ctx.save();
       ctx.setLineDash([5, 4]);
@@ -245,19 +266,20 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       ctx.restore();
     }
 
-    // Inning headers: "Xth: avg (min / max)" centered above each inning.
+    // Panel headers: "<label>: avg (min / max)" centered above each panel —
+    // "3rd" for an inning-sliced chart, "8/14" for a game-sliced one.
     // Default tracks the fastball family (4-seam/sinker, cutter fallback); when
     // a single pitch type is focused (legend lock or pitch-overview selection)
-    // the headers show that type's per-inning velo instead.
+    // the headers show that type's per-panel velo instead.
     const headerBucket = (is) => {
       if (!is) return null;
       if (focusedType) return is.byType[focusedType] || null;
       return is.fb.count > 0 ? is.fb : is.cutter;
     };
-    // Game-wide avg of the same series; per-inning delta colors against it.
+    // Frame-wide avg of the same series; per-panel delta colors against it.
     let gameRefSum = 0, gameRefCount = 0;
-    for (const inn of Object.keys(inningStats)) {
-      const bucket = headerBucket(inningStats[inn]);
+    for (const key of Object.keys(panelStats)) {
+      const bucket = headerBucket(panelStats[key]);
       if (bucket && bucket.count > 0) { gameRefSum += bucket.sum; gameRefCount += bucket.count; }
     }
     const gameRefAvg = gameRefCount > 0 ? gameRefSum / gameRefCount : 0;
@@ -280,14 +302,15 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
     ctx.textAlign = "center";
     ctx.textBaseline = "bottom";
     const headerHitRegions = [];
-    for (let i = 0; i < inningBounds.length; i++) {
-      const bd = inningBounds[i];
-      const inn = bd.inning;
+    const HDR_BOLD = "bold 12.5px 'DM Sans', sans-serif";
+    const HDR_PLAIN = "12.5px 'DM Sans', sans-serif";
+    for (let i = 0; i < panelBounds.length; i++) {
+      const bd = panelBounds[i];
       const sx = dividerXs[i];
       const ex = i + 1 < dividerXs.length ? dividerXs[i + 1] : PAD.left + plotW;
       const centerX = (sx + ex) / 2;
 
-      const is = inningStats[inn];
+      const is = panelStats[bd.key];
       const bucket = headerBucket(is);
       if (!bucket || bucket.count === 0) continue;
 
@@ -295,28 +318,62 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       const delta = avg - gameRefAvg;
       const headerColor = veloGradientColor(delta);
 
-      const label = `${ordinal(inn)}: ${avg.toFixed(1)}`;
+      const avgOnly = avg.toFixed(1);
+      // A panel with no name (a game row missing game_date) shows its velo alone
+      // rather than a stray ": 95.4".
+      const label = bd.label ? `${bd.label}: ${avgOnly}` : avgOnly;
       const range = `(${bucket.min.toFixed(1)} / ${bucket.max.toFixed(1)})`;
 
-      // Vertically center two lines (with 4px gap) between top of canvas and chart
+      // Headers degrade with panel width instead of overlapping into mush — a
+      // 26-start season packs panels into a fraction of an inning's width.
+      // Shed the range first, then break the one-line header into stacked
+      // name-over-velo, and only give up the panel's identity when even its
+      // name won't fit.
+      const avail = ex - sx - 6;
+      ctx.font = HDR_BOLD;
+      const wLabel = ctx.measureText(label).width;
+      const wAvg = ctx.measureText(avgOnly).width;
+      ctx.font = HDR_PLAIN;
+      const wRange = ctx.measureText(range).width;
+      const wName = ctx.measureText(bd.label).width;
+
+      let line1 = null, line2 = null;
+      if (wLabel <= avail && wRange <= avail) {
+        line1 = { text: label, font: HDR_BOLD, color: headerColor };
+        line2 = { text: range, font: HDR_PLAIN, color: "#E0E2EC" };
+      } else if (wLabel <= avail) {
+        line1 = { text: label, font: HDR_BOLD, color: headerColor };
+      } else if (bd.label && wName <= avail && wAvg <= avail) {
+        line1 = { text: bd.label, font: HDR_PLAIN, color: "#E0E2EC" };
+        line2 = { text: avgOnly, font: HDR_BOLD, color: headerColor };
+      } else if (wAvg <= avail) {
+        line1 = { text: avgOnly, font: HDR_BOLD, color: headerColor };
+      } else {
+        continue;
+      }
+
+      // Vertically center the header (two lines with a 4px gap, or one line)
+      // between the top of the canvas and the chart
       const lineH = 12.5;
       const gap = 4;
-      const totalH = lineH * 2 + gap;
+      const totalH = line2 ? lineH * 2 + gap : lineH;
       const midY = containerTop / 2;
       const line1Y = midY - totalH / 2 + lineH / 2;
       const line2Y = line1Y + lineH + gap;
 
       ctx.globalAlpha = 1;
       ctx.textBaseline = "middle";
-      ctx.font = "bold 12.5px 'DM Sans', sans-serif";
-      ctx.fillStyle = headerColor;
-      ctx.fillText(label, centerX, line1Y);
-      ctx.font = "12.5px 'DM Sans', sans-serif";
-      ctx.fillStyle = "#E0E2EC";
-      ctx.fillText(range, centerX, line2Y);
+      ctx.font = line1.font;
+      ctx.fillStyle = line1.color;
+      ctx.fillText(line1.text, centerX, line1Y);
+      if (line2) {
+        ctx.font = line2.font;
+        ctx.fillStyle = line2.color;
+        ctx.fillText(line2.text, centerX, line2Y);
+      }
 
-      // Store hit region for inning header hover
-      headerHitRegions.push({ inning: inn, left: sx, right: ex, top: 0, bottom: containerTop });
+      // Store hit region for panel header hover (inning tooltip is inning-only)
+      headerHitRegions.push({ inning: bd.inning, left: sx, right: ex, top: 0, bottom: containerTop });
     }
     inningHeadersRef.current = headerHitRegions;
 
@@ -454,17 +511,18 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       }
     }
 
-    // X-axis: pitch numbers at intervals of 15
+    // X-axis: cumulative pitch numbers, spaced to the size of the frame
     ctx.fillStyle = "#FFFFF0";
     ctx.font = "12px 'DM Sans', sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    for (let i = 15; i <= totalPitches; i += 15) {
+    const tickStep = axisTickStep(totalPitches);
+    for (let i = tickStep; i <= totalPitches; i += tickStep) {
       ctx.fillText(i, toX(i), containerBot + 8);
     }
 
     dotsRef.current = dots;
-  }, [ordered, pitchTypes, typeStats, inningBounds, inningStats, dims, globalMin, globalMax, activeHighlight, lockedType, focusedType]);
+  }, [ordered, pitchTypes, typeStats, panelBounds, panelStats, dims, globalMin, globalMax, activeHighlight, lockedType, focusedType]);
 
   // Hover handling
   const handleMouseMove = useCallback(
@@ -485,7 +543,9 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
           break;
         }
       }
-      if (hitHeader && linescoreData?.plays) {
+      // Play-by-play behind a header is an inning-panel idea — a game panel
+      // covers nine of them, and the season chart has no linescore anyway.
+      if (hitHeader && hitHeader.inning != null && !byGame && linescoreData?.plays) {
         setInningHover({ inning: hitHeader.inning, x: e.clientX, y: e.clientY });
         setHover(null);
         canvas.style.cursor = "default";
@@ -511,7 +571,7 @@ export default function VelocityTrendV2({ pitches, onReclassify, isMobile, lines
       }
       canvas.style.cursor = near ? "pointer" : "default";
     },
-    [dims, isMobile, H, linescoreData]
+    [dims, isMobile, H, linescoreData, byGame]
   );
 
   const handleMouseLeave = useCallback(() => {

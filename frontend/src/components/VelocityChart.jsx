@@ -5,16 +5,22 @@ import VelocityTrendV2 from "./VelocityTrendV2";
 // Single public entry point for the velocity-trend chart. Views import this
 // instead of reaching for VelocityTrend / VelocityTrendV2 directly.
 //
-//   mode="game"             → rich single-game chart with inning overlays and
-//                             linescore-aware PBP hints (VelocityTrendV2).
-//   mode="season" (default) → simpler multi-game season trend (VelocityTrend).
+//   mode="game"             → one game, panelled by INNING, with the linescore
+//                             play-by-play behind each inning header.
+//   mode="season" (default) → many games, panelled by GAME: same chart, same
+//                             legend lock, headers carry per-start velo.
+//   mode="lanes"            → the original per-pitch-type swim-lane chart.
 //
-// Full consolidation onto one implementation is intentionally deferred, not
-// done here: VelocityTrendV2 is built around a single game's inning structure
-// and linescore overlays, while the season page needs a multi-game trend.
-// Collapsing them is a canvas-chart rewrite — out of scope for a
-// behavior-preserving refactor. This wrapper gives the destination app one
-// import + one prop to flip, so the eventual merge touches one seam.
+// Both live modes are VelocityTrendV2 — the difference is what one panel means,
+// which is the `groupBy` prop. A season cannot be panelled by inning (every
+// start has a 3rd inning) and a single game gains nothing from being panelled
+// by game, so the caller picks by the data it holds, not by the page it is on.
+//
+// mode="lanes" is QUARANTINED: VelocityTrend sizes each pitch-type lane at
+// ~24.75px per pitch with no ceiling, so a real workload renders a chart
+// thousands of pixels tall — a season of four-seamers alone clears 10,000px.
+// It is kept for reference and has no callers; don't route a view at it
+// without fixing that scaling first.
 export default function VelocityChart({
   mode = "season",
   pitches,
@@ -23,16 +29,17 @@ export default function VelocityChart({
   linescoreData,
   pitcherId,
 }) {
-  if (mode === "game") {
-    return (
-      <VelocityTrendV2
-        pitches={pitches}
-        onReclassify={onReclassify}
-        isMobile={isMobile}
-        linescoreData={linescoreData}
-        pitcherId={pitcherId}
-      />
-    );
+  if (mode === "lanes") {
+    return <VelocityTrend pitches={pitches} isMobile={isMobile} />;
   }
-  return <VelocityTrend pitches={pitches} isMobile={isMobile} />;
+  return (
+    <VelocityTrendV2
+      groupBy={mode === "game" ? "inning" : "game"}
+      pitches={pitches}
+      onReclassify={onReclassify}
+      isMobile={isMobile}
+      linescoreData={linescoreData}
+      pitcherId={pitcherId}
+    />
+  );
 }

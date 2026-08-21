@@ -68,6 +68,7 @@ A game log is the one place two producers meet: Savant supplies AAA/AFL rows, th
 
 ### Frontend Components
 - `frontend/src/components/PitcherCard.jsx` — Main player card: Box Score table, pitch type metrics, strikezone plots, velocity trend, play-by-play. Receives `cardData`, `onReclassify`, `onPlayerClick` props.
+- `frontend/src/components/VelocityChart.jsx` — The ONE import for a velocity chart. `mode="game"` → V2 panelled by inning (game card); `mode="season"` → the same V2 panelled by game (player page); `mode="lanes"` → the quarantined v1 lane chart (see below).
 - `frontend/src/components/VelocityTrendV2.jsx` — Single-lane velocity chart with interactive legend. `lockedType` state for click-to-lock pitch type highlighting. When locked, draws swim lane overlay (top/bottom lines, dotted avg line, right-side labels with anti-overlap). `activeHighlight = lockedType || highlightType`.
 - `frontend/src/components/StrikeZonePlot.jsx` — Canvas strikezone with reclassify on click. Accepts `onReclassify` prop.
 - `frontend/src/components/PlayByPlayModal.jsx` — Lightbox PBP view with tooltips.
@@ -206,8 +207,15 @@ In `getTooltipResult`, fielder's choice and force outs are in the trajectory-bas
 - **Click canvas dot:** Opens reclassify lightbox (same as MovementPlot and StrikeZonePlot)
 - Legend items use `padding: 2px 10px` with `gap: 0` on parent to eliminate hover jitter between items
 
-## Dynamic Heights (VelocityTrend v1 swim lanes)
-Formula: `max(50, round(24.75 * pitchCount))` with 4-pitch = 99px baseline.
+## Velocity chart panels — a panel is an inning OR a game
+Both surfaces render VelocityTrendV2; `groupBy` is the only difference, and it follows the DATA, not the page. `utils/velocityChart.js` decides: `resolveSingleGamePk` (the dropdown's pick, or the pitcher's only start) → `velocityChartMode` → `mode`.
+- `groupBy="inning"` — one game. Headers read `3rd: 96.4 (93.6 / 99.2)`, and hovering one opens the linescore play-by-play. The player page fetches `/api/game-linescore` for the selected game only while the Velocity Trend view is open, so those headers work there too.
+- `groupBy="game"` — many games. Headers read `8/14: 95.6`, panels are one start each, and sorting leads with `game_date`: **`at_bat_number` restarts every game**, so the single-game sort alone would interleave every start. Panelling a season by inning is the other half of the same trap — it would pool all 26 third innings into one header.
+- Headers degrade by measured width, not by a count: label+range → label → date stacked over velo → velo alone → nothing. A 26-start season lands on the stacked tier; an inning panel keeps the full two-line header.
+- `axisTickStep` floors at 15 so a single game still prints 15/30/45… exactly as the card always has; a season steps by ~total/10 instead of printing a hundred labels. Pinned by `utils/__tests__/velocityChart.test.js`.
+
+## VelocityTrend v1 (`mode="lanes"`) is QUARANTINED — no callers
+Its per-pitch-type lane height is `max(50, round(24.75 * pitchCount))` with **no ceiling**: a 30-pitch four-seamer lane is 743px and a season's worth clears 10,000px, which is what made the player-page chart a mile-tall column of dots. Don't route a view at `mode="lanes"` without fixing that scaling first.
 
 ## Create Tabs / Background-Tab Opening (browser policy — verified June 2026)
 `openInNewWindow`/`openHashesInNewTabs` in `App.jsx` dispatch synthetic clicks on real `<a target="_blank">` anchors (this bypasses the popup blocker even for 30 opens, unlike a `window.open` loop). Hard constraints, all verified empirically in Chrome against prod:
